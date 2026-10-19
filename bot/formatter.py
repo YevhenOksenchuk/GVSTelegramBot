@@ -62,7 +62,11 @@ def format_caption(schedule: Schedule, source_url: str) -> str:
             lines += ["", f"✏️ — змінилось відносно {_previous_label(schedule)}"]
         elif schedule.has_previous:
             lines += ["", "Майбутні години без змін"]
-        lines += ["", f'<a href="{escape(source_url)}">Джерело: Черкасиобленерго</a>']
+        lines += [
+            "",
+            'Своя черга: <a href="https://www.cherkasyoblenergo.com/off">cherkasyoblenergo.com/off</a>',
+            f'<a href="{escape(source_url)}">Джерело: Черкасиобленерго</a>',
+        ]
         return "\n".join(lines)
 
     text = build(with_details=True)

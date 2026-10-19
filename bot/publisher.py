@@ -6,7 +6,7 @@ import logging
 import re
 from datetime import date, datetime
 from html import escape
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, FrozenSet, List, Optional, Tuple
 
 import httpx
 from aiogram import Bot
@@ -16,7 +16,7 @@ from aiogram.exceptions import (
     TelegramMigrateToChat,
     TelegramRetryAfter,
 )
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 
 try:
     from zoneinfo import ZoneInfo
@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover
     from backports.zoneinfo import ZoneInfo  # type: ignore
 
 from .alerts import Alerts
+from .announcements import format_announcement, is_announcement
 from .formatter import format_caption
 from .parser import Schedule, parse_post, unrecognized_lines
 from .render import render_schedule
@@ -78,6 +79,7 @@ async def load_schedule(
     schedule = _parse(text, posted_at)
     if not schedule:
         return None
+    schedule.post_id = post_id
     candidates = [(prev_text, posted_at.isoformat())] if prev_text else []
     candidates += await storage.schedule_posts_before(post_id)
     for old_text, old_posted in candidates:
@@ -97,24 +99,34 @@ async def has_newer_for_day(storage: Storage, post_id: int, schedule: Schedule) 
     return False
 
 
+async def latest_by_day(storage: Storage, limit: int = 30) -> Dict[date, Tuple[Schedule, str]]:
+    """Найсвіжіший графік на кожну дату серед останніх постів: дата -> (графік, посилання)."""
+    latest: Dict[date, Tuple[Schedule, str]] = {}
+    for post_id, text, url, posted_at in await storage.recent_schedule_posts(limit):
+        quick = _parse(text, datetime.fromisoformat(posted_at))  # без порівняння з попередніми — дешево
+        if not quick or not quick.day or quick.day in latest:
+            continue
+        schedule = await load_schedule(storage, post_id, text, datetime.fromisoformat(posted_at))
+        if schedule:
+            latest[schedule.day] = (schedule, url)
+    return latest
+
+
 async def current_schedules(storage: Storage) -> List[Tuple[Schedule, str]]:
     """Актуальні графіки: найсвіжіший на кожну дату від сьогодні, за зростанням дати.
 
     Якщо таких немає — останній відомий графік.
     """
     today = kyiv_now().date()
-    latest: Dict[date, Tuple[Schedule, str]] = {}
-    fallback: Optional[Tuple[Schedule, str]] = None
-    for post_id, text, url, posted_at in await storage.recent_schedule_posts():
-        schedule = await load_schedule(storage, post_id, text, datetime.fromisoformat(posted_at))
-        if not schedule:
-            continue
-        fallback = fallback or (schedule, url)
-        if schedule.day and schedule.day >= today and schedule.day not in latest:
-            latest[schedule.day] = (schedule, url)
-    if latest:
-        return [latest[d] for d in sorted(latest)]
-    return [fallback] if fallback else []
+    latest = await latest_by_day(storage)
+    future = [latest[d] for d in sorted(latest) if d >= today]
+    if future:
+        return future
+    return [latest[max(latest)]] if latest else []
+
+
+async def latest_schedule_for_day(storage: Storage, day: date) -> Optional[Tuple[Schedule, str]]:
+    return (await latest_by_day(storage)).get(day)
 
 
 async def deactivate_with_alert(storage: Storage, chat_id: int, reason: str) -> None:
@@ -132,20 +144,31 @@ async def deactivate_with_alert(storage: Storage, chat_id: int, reason: str) -> 
 
 
 async def send_schedule(
-    bot: Bot, storage: Storage, chat_id: int, png: Optional[bytes], caption: str
-) -> bool:
+    bot: Bot, storage: Storage, chat_id: int, png: Optional[bytes], caption: str,
+    post_id: Optional[int] = None, day: Optional[date] = None,
+) -> Optional[int]:
+    """Надіслати графік (фото з підписом або лише текст). Повертає message_id, якщо вдалося.
+
+    post_id/day — щоб запам'ятати повідомлення для закріплення та /fix.
+    """
     for _ in range(3):
         try:
             if png is None:
-                await bot.send_message(chat_id, caption, parse_mode="HTML", disable_web_page_preview=True)
+                msg = await bot.send_message(chat_id, caption, parse_mode="HTML", disable_web_page_preview=True)
             else:
-                await bot.send_photo(
+                msg = await bot.send_photo(
                     chat_id,
                     BufferedInputFile(png, filename="grafik.png"),
                     caption=caption,
                     parse_mode="HTML",
                 )
-            return True
+            message_id = getattr(msg, "message_id", None)
+            if message_id and post_id is not None:
+                await storage.record_sent(
+                    chat_id, message_id, post_id, day.isoformat() if day else None,
+                    "text" if png is None else "photo",
+                )
+            return message_id
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after + 1)
         except TelegramMigrateToChat as e:
@@ -154,45 +177,159 @@ async def send_schedule(
         except TelegramForbiddenError as e:
             log.info("Чат %s заблокував бота — деактивую", chat_id)
             await deactivate_with_alert(storage, chat_id, str(e))
-            return False
+            return None
         except TelegramBadRequest as e:
             if "chat not found" in str(e).lower() or "not enough rights" in str(e).lower():
                 log.info("Чат %s недоступний (%s) — деактивую", chat_id, e)
                 await deactivate_with_alert(storage, chat_id, str(e))
             else:
                 log.warning("Не вдалося надіслати в %s: %s", chat_id, e)
-            return False
+            return None
         except Exception:  # мережа тощо — пропускаємо цей чат, решта отримає
             log.exception("Помилка надсилання в %s", chat_id)
-            return False
-    return False
+            return None
+    return None
 
 
-async def publish_current(bot: Bot, storage: Storage, chat_id: int) -> int:
+PIN_RETRY_AFTER = 86400  # секунд: без прав на закріплення не пробуємо знову цілу добу
+
+
+async def maybe_pin(bot: Bot, storage: Storage, chat_id: int, chat_type: str, message_id: int) -> bool:
+    """Закріпити графік у каналі/групі (тихо) і зняти попереднє закріплення бота."""
+    if chat_type == "private":
+        return False
+    pinned, enabled, failed_at = await storage.pin_state(chat_id)
+    if not enabled:
+        return False
+    if failed_at and (kyiv_now() - datetime.fromisoformat(failed_at)).total_seconds() < PIN_RETRY_AFTER:
+        return False
+    try:
+        await bot.pin_chat_message(chat_id, message_id, disable_notification=True)
+    except Exception as e:
+        await storage.set_pin_failed(chat_id, kyiv_now().isoformat())
+        title = await storage.get_chat_title(chat_id) or str(chat_id)
+        right = "«Редагувати повідомлення інших»" if chat_type == "channel" else "«Закріплювати повідомлення»"
+        await _alert(
+            f"pin:{chat_id}",
+            f"📌 Не можу закріпити графік у <b>{escape(title)}</b>. Дайте боту право {right} "
+            f"або вимкніть закріплення для цього чату командою /pin.\n<i>{escape(str(e))}</i>",
+            ttl=7 * 86400,
+        )
+        return False
+    if pinned and pinned != message_id:
+        try:
+            await bot.unpin_chat_message(chat_id, message_id=pinned)
+        except Exception:
+            pass  # уже відкріпили вручну
+    await storage.set_pinned(chat_id, message_id)
+    return True
+
+
+async def publish_current(bot: Bot, storage: Storage, chat_id: int, pin: bool = False) -> int:
     """Надіслати в чат актуальні графіки (сьогодні й завтра). Повертає кількість надісланих."""
-    sent = 0
+    sent, last_id = 0, None
     for schedule, url in await current_schedules(storage):
         png, caption = build_message(schedule, url)
-        if await send_schedule(bot, storage, chat_id, png, caption):
-            sent += 1
+        message_id = await send_schedule(bot, storage, chat_id, png, caption, schedule.post_id, schedule.day)
+        if message_id:
+            sent, last_id = sent + 1, message_id
+    if pin and last_id:
+        await maybe_pin(bot, storage, chat_id, await storage.get_chat_type(chat_id) or "private", last_id)
     return sent
 
 
 async def broadcast(bot: Bot, storage: Storage, schedule: Schedule, url: str) -> int:
     png, caption = build_message(schedule, url)
     sent = 0
-    for chat_id in await storage.active_chats():
-        if await send_schedule(bot, storage, chat_id, png, caption):
+    for chat_id, chat_type in await storage.active_chats_typed():
+        message_id = await send_schedule(bot, storage, chat_id, png, caption, schedule.post_id, schedule.day)
+        if message_id:
             sent += 1
+            await maybe_pin(bot, storage, chat_id, chat_type, message_id)
         await asyncio.sleep(0.05)
     log.info("Графік на %s розіслано в %d чатів", schedule.date_label, sent)
     return sent
 
 
+async def fix_messages(bot: Bot, storage: Storage, day: date) -> Tuple[int, List[Tuple[str, str]]]:
+    """Замінити картинку й текст у вже надісланих повідомленнях за дату на актуальну версію графіка.
+
+    Повертає (скільки оновлено, [(назва чату, помилка), ...]).
+    """
+    found = await latest_schedule_for_day(storage, day)
+    if not found:
+        return 0, [("—", "немає графіка на цю дату")]
+    schedule, url = found
+    png, caption = build_message(schedule, url)
+    ok, failures = 0, []
+    for chat_id, message_id, kind in await storage.latest_sent_per_chat(day.isoformat()):
+        title = await storage.get_chat_title(chat_id) or str(chat_id)
+        try:
+            if kind == "photo" and png is not None:
+                media = InputMediaPhoto(media=BufferedInputFile(png, filename="grafik.png"),
+                                        caption=caption, parse_mode="HTML")
+                await bot.edit_message_media(media, chat_id=chat_id, message_id=message_id)
+            elif kind == "photo":
+                await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=caption,
+                                               parse_mode="HTML")
+            else:
+                await bot.edit_message_text(caption, chat_id=chat_id, message_id=message_id, parse_mode="HTML",
+                                            disable_web_page_preview=True)
+            ok += 1
+        except TelegramBadRequest as e:
+            if "not modified" in str(e).lower():
+                ok += 1  # уже актуальне
+            else:
+                failures.append((title, str(e)))
+        except Exception as e:
+            failures.append((title, str(e)))
+        await asyncio.sleep(0.05)
+    return ok, failures
+
+
+async def propose_announcement(bot: Bot, storage: Storage, owner_ids: FrozenSet[int], post: Post) -> None:
+    """Надіслати власникам пост-оголошення з кнопками «Опублікувати всім / Пропустити»."""
+    if not owner_ids or await storage.announcement_status(post.post_id) is not None:
+        return
+    await storage.set_announcement(post.post_id, "pending")
+    quote = post.text[:1500] + ("…" if len(post.text) > 1500 else "")
+    text = (f"📰 <b>Оголошення обленерго</b> — опублікувати в усі чати?\n\n"
+            f"<i>{escape(quote)}</i>\n\n{post.url}")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📣 Опублікувати всім", callback_data=f"ann:pub:{post.post_id}"),
+        InlineKeyboardButton(text="🙈 Пропустити", callback_data=f"ann:skip:{post.post_id}"),
+    ]])
+    for owner in owner_ids:
+        try:
+            msg = await bot.send_message(owner, text, parse_mode="HTML", reply_markup=keyboard,
+                                         disable_web_page_preview=True)
+            await storage.save_prompt("announcement", post.post_id, owner, msg.message_id)
+        except Exception as e:
+            log.warning("Не вдалося надіслати оголошення власнику %s: %s", owner, e)
+
+
+async def publish_announcement(bot: Bot, storage: Storage, post_id: int) -> int:
+    """Опублікувати оголошення текстом в усі активні чати. Повертає кількість чатів."""
+    row = await storage.get_post(post_id)
+    if not row:
+        return 0
+    text, url, _ = row
+    body = format_announcement(text, url)
+    sent = 0
+    for chat_id, _ in await storage.active_chats_typed():
+        if await send_schedule(bot, storage, chat_id, None, body, post_id, None):
+            sent += 1
+        await asyncio.sleep(0.05)
+    log.info("Оголошення %s розіслано в %d чатів", post_id, sent)
+    return sent
+
+
 class Watcher:
-    def __init__(self, bot: Bot, storage: Storage, channel: str, interval: int, healthcheck_url: str = ""):
+    def __init__(self, bot: Bot, storage: Storage, channel: str, interval: int, healthcheck_url: str = "",
+                 owner_ids: FrozenSet[int] = frozenset()):
         self.bot, self.storage, self.channel, self.interval = bot, storage, channel, interval
         self.healthcheck_url = healthcheck_url
+        self.owner_ids = owner_ids
         self.last_check: Optional[datetime] = None    # остання спроба (для /stats і сторожового таймера)
         self.last_success: Optional[datetime] = None  # остання вдала перевірка
         self.last_error: Optional[str] = None
@@ -216,6 +353,8 @@ class Watcher:
                 continue
             await self.report_post_problems(post, schedule)
             if schedule is None:
+                if old_hash is None and is_announcement(post.text):  # новий пост без графіка — на модерацію
+                    await propose_announcement(self.bot, self.storage, self.owner_ids, post)
                 continue
             if schedule.day and schedule.day < kyiv_now().date():
                 continue  # старий графік — не спамимо

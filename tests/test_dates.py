@@ -1,6 +1,7 @@
 """Графіки на різні дати: сьогодні / завтра та їх оновлення вперемішку."""
 import asyncio
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 from bot import publisher
 from bot.scraper import Post
@@ -26,6 +27,13 @@ class FakeBot:
 
     async def send_photo(self, chat_id, photo, caption, parse_mode):
         self.sent.append(caption)
+        return SimpleNamespace(message_id=len(self.sent))
+
+    async def pin_chat_message(self, chat_id, message_id, disable_notification=False):
+        pass
+
+    async def unpin_chat_message(self, chat_id, message_id=None):
+        pass
 
 
 def run(tmp_path, monkeypatch, scenario):
@@ -228,6 +236,7 @@ def test_text_fallback_when_render_fails(monkeypatch):
     class Bot:
         async def send_message(self, chat_id, text, parse_mode, disable_web_page_preview):
             sent.append(("text", chat_id, text))
+            return SimpleNamespace(message_id=1)
 
     def boom(schedule):
         raise ValueError("render failed")

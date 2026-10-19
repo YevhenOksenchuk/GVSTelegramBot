@@ -8,7 +8,8 @@ main() {
   cd "$(dirname "$(readlink -f "$0")")"
 
   echo "▶ Оновлюю код з GitHub…"
-  git pull --ff-only
+  git fetch -q origin
+  git reset -q --hard origin/main   # сервер не має власних змін — беремо рівно те, що на GitHub
 
   BOT_VERSION="$(git rev-parse --short HEAD) · $(git log -1 --date=format:%d.%m.%Y --format=%cd)"
   export BOT_VERSION

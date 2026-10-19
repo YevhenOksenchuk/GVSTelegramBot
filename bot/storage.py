@@ -41,7 +41,36 @@ CREATE TABLE IF NOT EXISTS posts (
     posted_at    TEXT,
     seen_at      TEXT DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS sent_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    post_id     INTEGER,            -- пост обленерго, з якого зроблено повідомлення
+    day         TEXT,               -- дата графіка YYYY-MM-DD; NULL для оголошень
+    kind        TEXT NOT NULL,      -- photo | text
+    sent_at     TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS sent_messages_day ON sent_messages(day, chat_id);
+CREATE TABLE IF NOT EXISTS owner_prompts (
+    kind        TEXT NOT NULL,      -- announcement
+    ref_id      INTEGER NOT NULL,   -- post_id
+    chat_id     INTEGER NOT NULL,   -- власник, якому надіслано запит
+    message_id  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS announcements (
+    post_id     INTEGER PRIMARY KEY,
+    status      TEXT NOT NULL,      -- pending | published | skipped
+    decided_by  INTEGER,
+    decided_at  TEXT
+);
 """
+
+# Колонки, додані пізніше за створення таблиці (для баз, що вже існують)
+_CHAT_COLUMNS = (
+    ("pinned_message_id", "INTEGER"),               # останнє закріплене ботом повідомлення
+    ("pin_enabled", "INTEGER NOT NULL DEFAULT 1"),  # чи закріплювати графіки в цьому чаті
+    ("pin_failed_at", "TEXT"),                      # коли востаннє не вдалося (немає прав) — не повторюємо 24 год
+)
 
 
 def text_hash(text: str) -> str:
@@ -57,7 +86,15 @@ class Storage:
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         self.db = await aiosqlite.connect(self.path)
         await self.db.executescript(SCHEMA)
+        await self._migrate()
         await self.db.commit()
+
+    async def _migrate(self) -> None:
+        async with self.db.execute("PRAGMA table_info(chats)") as cur:
+            existing = {row[1] for row in await cur.fetchall()}
+        for name, ddl in _CHAT_COLUMNS:
+            if name not in existing:
+                await self.db.execute(f"ALTER TABLE chats ADD COLUMN {name} {ddl}")
 
     async def close(self) -> None:
         if self.db:
@@ -88,6 +125,110 @@ class Storage:
     async def active_chats(self) -> List[int]:
         async with self.db.execute("SELECT chat_id FROM chats WHERE active=1") as cur:
             return [r[0] for r in await cur.fetchall()]
+
+    async def active_chats_typed(self) -> List[Tuple[int, str]]:
+        """(chat_id, type) усіх активних чатів."""
+        async with self.db.execute("SELECT chat_id, type FROM chats WHERE active=1 ORDER BY chat_id") as cur:
+            return [(r[0], r[1]) for r in await cur.fetchall()]
+
+    # --- закріплення ---
+    async def pin_state(self, chat_id: int) -> Tuple[Optional[int], bool, Optional[str]]:
+        """(pinned_message_id, pin_enabled, pin_failed_at)"""
+        async with self.db.execute(
+            "SELECT pinned_message_id, pin_enabled, pin_failed_at FROM chats WHERE chat_id=?", (chat_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return (row[0], bool(row[1]), row[2]) if row else (None, True, None)
+
+    async def set_pinned(self, chat_id: int, message_id: int) -> None:
+        await self.db.execute(
+            "UPDATE chats SET pinned_message_id=?, pin_failed_at=NULL WHERE chat_id=?", (message_id, chat_id)
+        )
+        await self.db.commit()
+
+    async def set_pin_enabled(self, chat_id: int, enabled: bool) -> None:
+        await self.db.execute(
+            "UPDATE chats SET pin_enabled=?, pin_failed_at=NULL WHERE chat_id=?", (int(enabled), chat_id)
+        )
+        await self.db.commit()
+
+    async def set_pin_failed(self, chat_id: int, when: Optional[str]) -> None:
+        await self.db.execute("UPDATE chats SET pin_failed_at=? WHERE chat_id=?", (when, chat_id))
+        await self.db.commit()
+
+    async def connected_chats_pins(self) -> List[Tuple[int, str, str, bool]]:
+        """(chat_id, title, type, pin_enabled) активних каналів і груп."""
+        async with self.db.execute(
+            "SELECT chat_id, title, type, pin_enabled FROM chats WHERE active=1 AND type != 'private' "
+            "ORDER BY type, title"
+        ) as cur:
+            return [(r[0], r[1], r[2], bool(r[3])) for r in await cur.fetchall()]
+
+    # --- надіслані повідомлення (для закріплення, /fix) ---
+    async def record_sent(self, chat_id: int, message_id: int, post_id: Optional[int],
+                          day: Optional[str], kind: str) -> None:
+        await self.db.execute(
+            "INSERT INTO sent_messages (chat_id, message_id, post_id, day, kind) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, message_id, post_id, day, kind),
+        )
+        await self.db.commit()
+
+    async def latest_sent_per_chat(self, day: str) -> List[Tuple[int, int, str]]:
+        """Для кожного активного чату — найсвіжіше повідомлення бота з графіком на цю дату."""
+        async with self.db.execute(
+            "SELECT chat_id, message_id, kind FROM sent_messages WHERE id IN "
+            "(SELECT MAX(id) FROM sent_messages WHERE day=? GROUP BY chat_id) "
+            "AND chat_id IN (SELECT chat_id FROM chats WHERE active=1) ORDER BY chat_id",
+            (day,),
+        ) as cur:
+            return [(r[0], r[1], r[2]) for r in await cur.fetchall()]
+
+    async def sent_for_post(self, post_id: int) -> List[Tuple[int, int, str]]:
+        async with self.db.execute(
+            "SELECT chat_id, message_id, kind FROM sent_messages WHERE post_id=? ORDER BY id", (post_id,)
+        ) as cur:
+            return [(r[0], r[1], r[2]) for r in await cur.fetchall()]
+
+    async def sent_days(self, limit: int = 3) -> List[Tuple[str, int]]:
+        """(день, кількість чатів) за датами графіків, від найсвіжішої."""
+        async with self.db.execute(
+            "SELECT day, COUNT(DISTINCT chat_id) FROM sent_messages WHERE day IS NOT NULL "
+            "GROUP BY day ORDER BY day DESC LIMIT ?",
+            (limit,),
+        ) as cur:
+            return [(r[0], r[1]) for r in await cur.fetchall()]
+
+    # --- запити власникам (оголошення) ---
+    async def save_prompt(self, kind: str, ref_id: int, chat_id: int, message_id: int) -> None:
+        await self.db.execute(
+            "INSERT INTO owner_prompts (kind, ref_id, chat_id, message_id) VALUES (?, ?, ?, ?)",
+            (kind, ref_id, chat_id, message_id),
+        )
+        await self.db.commit()
+
+    async def pop_prompts(self, kind: str, ref_id: int) -> List[Tuple[int, int]]:
+        async with self.db.execute(
+            "SELECT chat_id, message_id FROM owner_prompts WHERE kind=? AND ref_id=?", (kind, ref_id)
+        ) as cur:
+            rows = [(r[0], r[1]) for r in await cur.fetchall()]
+        await self.db.execute("DELETE FROM owner_prompts WHERE kind=? AND ref_id=?", (kind, ref_id))
+        await self.db.commit()
+        return rows
+
+    async def announcement_status(self, post_id: int) -> Optional[str]:
+        async with self.db.execute("SELECT status FROM announcements WHERE post_id=?", (post_id,)) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else None
+
+    async def set_announcement(self, post_id: int, status: str, decided_by: Optional[int] = None) -> None:
+        await self.db.execute(
+            """INSERT INTO announcements (post_id, status, decided_by, decided_at)
+               VALUES (?, ?, ?, CASE WHEN ? IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END)
+               ON CONFLICT(post_id) DO UPDATE SET status=excluded.status, decided_by=excluded.decided_by,
+                   decided_at=excluded.decided_at""",
+            (post_id, status, decided_by, decided_by),
+        )
+        await self.db.commit()
 
     async def connected_chats(self) -> List[Tuple[int, str, str]]:
         """(chat_id, title, type) активних каналів і груп (без особистих)."""
@@ -207,6 +348,12 @@ class Storage:
         async with self.db.execute("SELECT text FROM posts WHERE post_id=?", (post_id,)) as cur:
             row = await cur.fetchone()
         return row[0] if row else None
+
+    async def get_post(self, post_id: int) -> Optional[Tuple[str, str, str]]:
+        """(text, url, posted_at)"""
+        async with self.db.execute("SELECT text, url, posted_at FROM posts WHERE post_id=?", (post_id,)) as cur:
+            row = await cur.fetchone()
+        return tuple(row) if row else None
 
     async def schedule_posts_before(self, post_id: int, limit: int = 30) -> List[Tuple[str, str]]:
         """(text, posted_at) попередніх постів з графіком, від новіших до старіших."""

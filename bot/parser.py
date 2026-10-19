@@ -40,15 +40,14 @@ class Schedule:
     published: Optional[datetime] = None  # час публікації посту (Київ)
     has_previous: bool = False  # чи був раніше графік на цю ж дату
     previous: Optional["Schedule"] = None  # попередня версія графіка на цю ж дату
+    post_id: Optional[int] = None  # пост обленерго, з якого розібрано графік
 
     def off_minutes(self, queue: str) -> int:
         return sum(e - s for s, e in self.queues.get(queue, []))
 
     @property
     def date_label(self) -> str:
-        if not self.day:
-            return ""
-        return f"{self.day.day} {MONTHS_BY_NUM[self.day.month]}"
+        return date_label(self.day)
 
     @property
     def time_label(self) -> str:
@@ -92,6 +91,11 @@ class Schedule:
         self.has_previous = True
         self.previous = previous
         self.changed = {q for q in QUEUES if self.added(q) or self.removed(q)}
+
+
+def date_label(day: Optional[date]) -> str:
+    """9 жовтня"""
+    return f"{day.day} {MONTHS_BY_NUM[day.month]}" if day else ""
 
 
 def clip(intervals: List[Interval], start: int, end: int = 1440) -> List[Interval]:

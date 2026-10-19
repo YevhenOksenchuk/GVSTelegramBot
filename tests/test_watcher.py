@@ -1,5 +1,6 @@
 import asyncio
 import copy
+from types import SimpleNamespace
 from pathlib import Path
 
 from bot import publisher
@@ -15,6 +16,13 @@ class FakeBot:
 
     async def send_photo(self, chat_id, photo, caption, parse_mode):
         self.sent.append((chat_id, caption))
+        return SimpleNamespace(message_id=len(self.sent))
+
+    async def pin_chat_message(self, chat_id, message_id, disable_notification=False):
+        pass
+
+    async def unpin_chat_message(self, chat_id, message_id=None):
+        pass
 
 
 def test_watcher_first_run_then_new_and_edited(tmp_path, monkeypatch):

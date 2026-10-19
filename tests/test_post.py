@@ -18,9 +18,17 @@ class FakeBot:
 
     async def send_photo(self, chat_id, photo, caption, parse_mode):
         self.photos.append((chat_id, caption))
+        return SimpleNamespace(message_id=len(self.photos))
+
+    async def pin_chat_message(self, chat_id, message_id, disable_notification=False):
+        pass
+
+    async def unpin_chat_message(self, chat_id, message_id=None):
+        pass
 
     async def send_message(self, chat_id, text, **kw):
         self.messages.append((chat_id, text))
+        return SimpleNamespace(message_id=100 + len(self.messages))
 
     async def leave_chat(self, chat_id):
         self.left.append(chat_id)

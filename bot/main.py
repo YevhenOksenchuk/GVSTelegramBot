@@ -55,7 +55,7 @@ async def main() -> None:
     bot = Bot(cfg.bot_token)
     alerts = Alerts(bot, cfg.owner_ids)
     publisher.ALERTS = alerts
-    watcher = Watcher(bot, storage, cfg.source_channel, cfg.poll_interval, cfg.healthcheck_url)
+    watcher = Watcher(bot, storage, cfg.source_channel, cfg.poll_interval, cfg.healthcheck_url, cfg.owner_ids)
 
     dp = Dispatcher()
     dp["storage"] = storage
@@ -86,6 +86,8 @@ async def main() -> None:
                 BotCommand(command="post", description="Опублікувати графік у канал/групу"),
                 BotCommand(command="users", description="Хто має доступ"),
                 BotCommand(command="stats", description="Стан бота"),
+                BotCommand(command="fix", description="Перевидати графік у надісланих повідомленнях"),
+                BotCommand(command="pin", description="Закріплення графіка по чатах"),
                 BotCommand(command="backup", description="Надіслати бекап бази"),
             ], scope=BotCommandScopeChat(chat_id=owner))
         except Exception as e:  # власник ще не натискав Start
