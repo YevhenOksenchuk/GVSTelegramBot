@@ -16,7 +16,9 @@ from .alerts import Alerts
 from .config import load_config
 from .handlers import router
 from .maintenance import backup_loop
+from .myqueue import router as myqueue_router
 from .publisher import Watcher, kyiv_now
+from .reminders import reminders_loop
 from .storage import Storage
 
 WATCHDOG_STALE = 600  # секунд без спроби перевірити канал — вважаємо, що бот завис
@@ -65,6 +67,7 @@ async def main() -> None:
     dp["config"] = cfg
     dp["started_at"] = started_at
     dp.include_router(access_router)
+    dp.include_router(myqueue_router)
     dp.include_router(router)
     logging.info("Версія: %s", cfg.bot_version)
     if not cfg.owner_ids:
@@ -83,6 +86,7 @@ async def main() -> None:
     for owner in cfg.owner_ids:  # службові команди бачать лише власники
         try:
             await bot.set_my_commands(commands + [
+                BotCommand(command="my", description="Моя черга і нагадування"),
                 BotCommand(command="post", description="Опублікувати графік у канал/групу"),
                 BotCommand(command="users", description="Хто має доступ"),
                 BotCommand(command="stats", description="Стан бота"),
@@ -97,6 +101,7 @@ async def main() -> None:
     tasks = [
         watcher_task,
         asyncio.create_task(backup_loop(bot, storage, cfg.owner_ids, cfg.backup_hour)),
+        asyncio.create_task(reminders_loop(bot, storage, cfg.owner_ids)),
         asyncio.create_task(watchdog_loop(watcher, watcher_task, alerts)),
     ]
     try:

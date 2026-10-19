@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 from html import escape, unescape
-from typing import List
+from typing import List, Optional
 
 from .parser import QUEUES, Interval, Schedule
 
@@ -40,13 +40,17 @@ def _previous_label(schedule: Schedule) -> str:
     return f"графіка від {prev:%d.%m %H:%M}"
 
 
-def format_caption(schedule: Schedule, source_url: str) -> str:
+def format_caption(schedule: Schedule, source_url: str, my_queue: Optional[str] = None) -> str:
+    """Підпис до картинки. my_queue — підчерга читача (в особистих): додає персональний рядок угорі."""
     head = "🔄 <b>Оновлений графік ГПВ</b>" if schedule.updated else "⚡ <b>Графік відключень (ГПВ)</b>"
     if schedule.date_label:
         head += f" — <b>{escape(schedule.date_label)}</b>"
     intro = [head]
     if schedule.updated and schedule.time_label:
         intro.append(f"🕐 оновлено о {schedule.time_label}")
+    if my_queue:
+        mark = "  ✏️" if my_queue in schedule.changed else ""
+        intro += ["", f"💡 <b>Ваша {my_queue}:</b> {_intervals(schedule.queues.get(my_queue, []))}{mark}"]
 
     def build(with_details: bool) -> str:
         lines = intro + [""]

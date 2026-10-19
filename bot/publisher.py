@@ -227,22 +227,31 @@ async def maybe_pin(bot: Bot, storage: Storage, chat_id: int, chat_type: str, me
 
 async def publish_current(bot: Bot, storage: Storage, chat_id: int, pin: bool = False) -> int:
     """Надіслати в чат актуальні графіки (сьогодні й завтра). Повертає кількість надісланих."""
+    chat_type = await storage.get_chat_type(chat_id) or "private"
+    prefs = await storage.get_prefs(chat_id) if chat_type == "private" else None
+    my_queue = prefs[0] if prefs else None
     sent, last_id = 0, None
     for schedule, url in await current_schedules(storage):
         png, caption = build_message(schedule, url)
+        if my_queue:
+            caption = format_caption(schedule, url, my_queue=my_queue)
         message_id = await send_schedule(bot, storage, chat_id, png, caption, schedule.post_id, schedule.day)
         if message_id:
             sent, last_id = sent + 1, message_id
     if pin and last_id:
-        await maybe_pin(bot, storage, chat_id, await storage.get_chat_type(chat_id) or "private", last_id)
+        await maybe_pin(bot, storage, chat_id, chat_type, last_id)
     return sent
 
 
 async def broadcast(bot: Bot, storage: Storage, schedule: Schedule, url: str) -> int:
     png, caption = build_message(schedule, url)
+    my_queues = {user_id: queue for user_id, queue, _, _ in await storage.all_prefs()}
     sent = 0
     for chat_id, chat_type in await storage.active_chats_typed():
-        message_id = await send_schedule(bot, storage, chat_id, png, caption, schedule.post_id, schedule.day)
+        text = caption
+        if chat_type == "private" and chat_id in my_queues:  # персональний рядок «Ваша черга»
+            text = format_caption(schedule, url, my_queue=my_queues[chat_id])
+        message_id = await send_schedule(bot, storage, chat_id, png, text, schedule.post_id, schedule.day)
         if message_id:
             sent += 1
             await maybe_pin(bot, storage, chat_id, chat_type, message_id)

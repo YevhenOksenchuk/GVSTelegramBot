@@ -63,6 +63,20 @@ CREATE TABLE IF NOT EXISTS announcements (
     decided_by  INTEGER,
     decided_at  TEXT
 );
+CREATE TABLE IF NOT EXISTS user_prefs (
+    user_id       INTEGER PRIMARY KEY,
+    queue         TEXT,                         -- підчерга, напр. 3.2
+    lead_minutes  INTEGER NOT NULL DEFAULT 30,  -- за скільки хвилин нагадувати про відключення
+    notify_back   INTEGER NOT NULL DEFAULT 1,   -- повідомляти, коли світло має з'явитися
+    updated_at    TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS reminders_sent (
+    user_id   INTEGER NOT NULL,
+    kind      TEXT NOT NULL,      -- pre | back | cancel
+    event_at  TEXT NOT NULL,      -- момент події (ISO, Київ) — захист від повторів
+    sent_at   TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (user_id, kind, event_at)
+);
 """
 
 # Колонки, додані пізніше за створення таблиці (для баз, що вже існують)
@@ -323,6 +337,60 @@ class Storage:
         await self.db.execute("DELETE FROM access_requests WHERE user_id=?", (user_id,))
         await self.db.commit()
         return rows
+
+    # --- моя черга / нагадування ---
+    async def get_prefs(self, user_id: int) -> Optional[Tuple[Optional[str], int, bool]]:
+        """(queue, lead_minutes, notify_back) або None, якщо користувач нічого не налаштовував."""
+        async with self.db.execute(
+            "SELECT queue, lead_minutes, notify_back FROM user_prefs WHERE user_id=?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return (row[0], row[1], bool(row[2])) if row else None
+
+    async def all_prefs(self) -> List[Tuple[int, str, int, bool]]:
+        """(user_id, queue, lead_minutes, notify_back) усіх, хто обрав чергу."""
+        async with self.db.execute(
+            "SELECT user_id, queue, lead_minutes, notify_back FROM user_prefs WHERE queue IS NOT NULL"
+        ) as cur:
+            return [(r[0], r[1], r[2], bool(r[3])) for r in await cur.fetchall()]
+
+    async def set_pref(self, user_id: int, field: str, value) -> None:
+        assert field in ("queue", "lead_minutes", "notify_back")
+        if isinstance(value, bool):
+            value = int(value)
+        await self.db.execute(
+            f"INSERT INTO user_prefs (user_id, {field}) VALUES (?, ?) "
+            f"ON CONFLICT(user_id) DO UPDATE SET {field}=excluded.{field}, updated_at=CURRENT_TIMESTAMP",
+            (user_id, value),
+        )
+        await self.db.commit()
+
+    async def clear_prefs(self, user_id: int) -> None:
+        await self.db.execute("DELETE FROM user_prefs WHERE user_id=?", (user_id,))
+        await self.db.commit()
+
+    async def reminder_sent(self, user_id: int, kind: str, event_at: str) -> bool:
+        async with self.db.execute(
+            "SELECT 1 FROM reminders_sent WHERE user_id=? AND kind=? AND event_at=?", (user_id, kind, event_at)
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    async def mark_reminder(self, user_id: int, kind: str, event_at: str) -> None:
+        await self.db.execute(
+            "INSERT OR IGNORE INTO reminders_sent (user_id, kind, event_at) VALUES (?, ?, ?)",
+            (user_id, kind, event_at),
+        )
+        await self.db.commit()
+
+    async def sent_reminder_times(self, user_id: int, kind: str) -> List[str]:
+        async with self.db.execute(
+            "SELECT event_at FROM reminders_sent WHERE user_id=? AND kind=?", (user_id, kind)
+        ) as cur:
+            return [r[0] for r in await cur.fetchall()]
+
+    async def prune_reminders(self, days: int = 3) -> None:
+        await self.db.execute("DELETE FROM reminders_sent WHERE sent_at < datetime('now', ?)", (f"-{days} days",))
+        await self.db.commit()
 
     # --- пости ---
     async def has_any_posts(self) -> bool:
