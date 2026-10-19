@@ -17,6 +17,9 @@ class Config:
     source_channel: str
     poll_interval: int
     db_path: str
+    bot_version: str      # підставляє deploy.sh (git-коміт і дата); локально — "dev"
+    healthcheck_url: str  # пінг healthchecks.io після кожної вдалої перевірки; порожньо = вимкнено
+    backup_hour: int      # о котрій (Київ) щодня слати бекап бази власникам
 
 
 def parse_owner_ids(raw: str) -> FrozenSet[int]:
@@ -34,4 +37,7 @@ def load_config() -> Config:
         source_channel=os.getenv("SOURCE_CHANNEL", "pat_cherkasyoblenergo").lstrip("@"),
         poll_interval=max(20, int(os.getenv("POLL_INTERVAL", "60"))),
         db_path=os.getenv("DB_PATH", "data/bot.db"),
+        bot_version=os.getenv("BOT_VERSION", "").strip() or "dev",
+        healthcheck_url=os.getenv("HEALTHCHECK_URL", "").strip(),
+        backup_hour=min(23, max(0, int(os.getenv("BACKUP_HOUR", "4") or 4))),
     )

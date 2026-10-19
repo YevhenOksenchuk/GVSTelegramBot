@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import date, datetime
+from html import escape
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -21,14 +23,27 @@ try:
 except ImportError:  # pragma: no cover
     from backports.zoneinfo import ZoneInfo  # type: ignore
 
+from .alerts import Alerts
 from .formatter import format_caption
-from .parser import Schedule, parse_post
+from .parser import Schedule, parse_post, unrecognized_lines
 from .render import render_schedule
-from .scraper import fetch_posts
+from .scraper import Post, fetch_posts
 from .storage import Storage, text_hash
 
 log = logging.getLogger(__name__)
 KYIV = ZoneInfo("Europe/Kyiv")
+SOURCE_DOWN_AFTER = 600  # секунд без доступу до каналу обленерго — алерт власникам
+
+ALERTS: Optional[Alerts] = None  # встановлює main.py; у тестах може лишатися None
+
+
+async def _alert(key: str, text: str, ttl: int = 3600) -> None:
+    if ALERTS is not None:
+        await ALERTS.notify(key, text, ttl)
+
+
+def _looks_like_schedule(text: str) -> bool:
+    return bool(re.search(r"гпв|графік", text, re.I) and re.search(r"відключ", text, re.I))
 
 
 def kyiv_now() -> datetime:
@@ -102,6 +117,20 @@ async def current_schedules(storage: Storage) -> List[Tuple[Schedule, str]]:
     return [fallback] if fallback else []
 
 
+async def deactivate_with_alert(storage: Storage, chat_id: int, reason: str) -> None:
+    """Вимкнути чат і повідомити власників (лише канали/групи: блокування в особистих — не проблема)."""
+    title = await storage.get_chat_title(chat_id) or str(chat_id)
+    chat_type = await storage.get_chat_type(chat_id)
+    await storage.deactivate_chat(chat_id)
+    if chat_type == "private":
+        return
+    await _alert(
+        f"lost:{chat_id}",
+        f"⚠️ Бот втратив доступ до <b>{escape(title)}</b> — чат вимкнено.\n<i>{escape(reason)}</i>\n"
+        "Якщо це помилка — додайте бота знову або поверніть йому права.",
+    )
+
+
 async def send_schedule(
     bot: Bot, storage: Storage, chat_id: int, png: Optional[bytes], caption: str
 ) -> bool:
@@ -122,14 +151,14 @@ async def send_schedule(
         except TelegramMigrateToChat as e:
             await storage.migrate_chat(chat_id, e.migrate_to_chat_id)
             chat_id = e.migrate_to_chat_id
-        except TelegramForbiddenError:
+        except TelegramForbiddenError as e:
             log.info("Чат %s заблокував бота — деактивую", chat_id)
-            await storage.deactivate_chat(chat_id)
+            await deactivate_with_alert(storage, chat_id, str(e))
             return False
         except TelegramBadRequest as e:
             if "chat not found" in str(e).lower() or "not enough rights" in str(e).lower():
                 log.info("Чат %s недоступний (%s) — деактивую", chat_id, e)
-                await storage.deactivate_chat(chat_id)
+                await deactivate_with_alert(storage, chat_id, str(e))
             else:
                 log.warning("Не вдалося надіслати в %s: %s", chat_id, e)
             return False
@@ -161,10 +190,13 @@ async def broadcast(bot: Bot, storage: Storage, schedule: Schedule, url: str) ->
 
 
 class Watcher:
-    def __init__(self, bot: Bot, storage: Storage, channel: str, interval: int):
+    def __init__(self, bot: Bot, storage: Storage, channel: str, interval: int, healthcheck_url: str = ""):
         self.bot, self.storage, self.channel, self.interval = bot, storage, channel, interval
-        self.last_check: Optional[datetime] = None
+        self.healthcheck_url = healthcheck_url
+        self.last_check: Optional[datetime] = None    # остання спроба (для /stats і сторожового таймера)
+        self.last_success: Optional[datetime] = None  # остання вдала перевірка
         self.last_error: Optional[str] = None
+        self.failing_since: Optional[datetime] = None
 
     async def check_once(self, client: httpx.AsyncClient) -> None:
         first_run = not await self.storage.has_any_posts()
@@ -180,7 +212,10 @@ class Watcher:
             await self.storage.save_post(
                 post.post_id, post.text, post.url, post.posted_at.isoformat(), schedule is not None
             )
-            if first_run or schedule is None:
+            if first_run:
+                continue
+            await self.report_post_problems(post, schedule)
+            if schedule is None:
                 continue
             if schedule.day and schedule.day < kyiv_now().date():
                 continue  # старий графік — не спамимо
@@ -196,14 +231,63 @@ class Watcher:
         for schedule, url in to_publish.values():
             await broadcast(self.bot, self.storage, schedule, url)
 
+    async def report_post_problems(self, post: Post, schedule: Optional[Schedule]) -> None:
+        """Алерти власникам: рядки нового формату або графік-картинка, які бот не прочитає."""
+        bad = unrecognized_lines(post.text)
+        if bad:
+            shown = "\n".join(escape(line) for line in bad[:5])
+            await _alert(
+                f"parse:{post.post_id}",
+                f"⚠️ Не розпізнав рядки графіка (можливо, новий формат):\n<code>{shown}</code>\n{post.url}",
+                ttl=86400,
+            )
+        if schedule is None and post.has_photo and _looks_like_schedule(post.text):
+            await _alert(
+                f"photo:{post.post_id}",
+                f"⚠️ Схоже, графік опубліковано картинкою, а не текстом — бот його не прочитає:\n{post.url}",
+                ttl=86400,
+            )
+
+    async def on_success(self, client: Optional[httpx.AsyncClient] = None) -> None:
+        self.last_error = None
+        self.last_success = kyiv_now()
+        if self.failing_since is not None:
+            down_for = (self.last_success - self.failing_since).total_seconds()
+            self.failing_since = None
+            if down_for >= SOURCE_DOWN_AFTER:
+                if ALERTS is not None:
+                    ALERTS.reset("source_down")
+                await _alert(
+                    "source_up", f"✅ Канал обленерго знову доступний (не було {int(down_for // 60)} хв).", ttl=0
+                )
+        if self.healthcheck_url and client is not None:  # зовнішній нагляд (healthchecks.io)
+            try:
+                await client.get(self.healthcheck_url, timeout=5)
+            except Exception as e:
+                log.info("Пінг healthcheck не вдався: %s", e)
+
+    async def on_failure(self, error: str) -> None:
+        self.last_error = error
+        now = kyiv_now()
+        if self.failing_since is None:
+            self.failing_since = now
+            return
+        down_for = (now - self.failing_since).total_seconds()
+        if down_for >= SOURCE_DOWN_AFTER:
+            await _alert(
+                "source_down",
+                f"⚠️ Не можу прочитати канал обленерго вже {int(down_for // 60)} хв.\n<i>{escape(error)}</i>",
+                ttl=6 * 3600,
+            )
+
     async def run(self) -> None:
         async with httpx.AsyncClient() as client:
             while True:
+                self.last_check = kyiv_now()
                 try:
                     await self.check_once(client)
-                    self.last_error = None
+                    await self.on_success(client)
                 except Exception as e:  # мережа, зміна верстки тощо — не падаємо
-                    self.last_error = f"{type(e).__name__}: {e}"
                     log.exception("Помилка перевірки каналу")
-                self.last_check = kyiv_now()
+                    await self.on_failure(f"{type(e).__name__}: {e}")
                 await asyncio.sleep(self.interval)

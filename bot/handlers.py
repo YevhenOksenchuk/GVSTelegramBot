@@ -1,8 +1,9 @@
 """Команди бота та реєстрація чатів."""
 from __future__ import annotations
 
+from datetime import datetime
 from html import escape
-from typing import FrozenSet
+from typing import FrozenSet, Optional
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatMemberStatus, ChatType
@@ -10,7 +11,9 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from .access import is_allowed, request_access, welcome_text
-from .publisher import Watcher, publish_current
+from .config import Config
+from .maintenance import LAST_BACKUP_AT, send_backup
+from .publisher import Watcher, kyiv_now, publish_current
 from .storage import Storage
 
 router = Router()
@@ -110,15 +113,48 @@ async def cmd_now(message: Message, storage: Storage, bot: Bot, owner_ids: Froze
         await message.answer("Поки що графіків не знайдено 🤷")
 
 
+def _fmt_time(value: Optional[datetime]) -> str:
+    return value.strftime("%d.%m %H:%M:%S") if value else "ще не було"
+
+
+def _fmt_uptime(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    days, minutes = divmod(minutes, 1440)
+    hours, minutes = divmod(minutes, 60)
+    parts = [f"{days} дн"] if days else []
+    if hours or days:
+        parts.append(f"{hours} год")
+    parts.append(f"{minutes} хв")
+    return " ".join(parts)
+
+
 @router.message(Command("stats"))
-async def cmd_stats(message: Message, storage: Storage, watcher: Watcher, owner_ids: FrozenSet[int]) -> None:
+async def cmd_stats(message: Message, storage: Storage, watcher: Watcher, owner_ids: FrozenSet[int],
+                    config: Config, started_at: datetime) -> None:
     if message.from_user.id not in owner_ids:
         return
     rows = await storage.stats()
     by_type = "\n".join(f"• {t}: {n}" for t, n in rows) or "• немає"
-    last = watcher.last_check.strftime("%d.%m %H:%M:%S") if watcher.last_check else "ще не було"
-    err = f"\n⚠️ Остання помилка: {watcher.last_error}" if watcher.last_error else ""
-    await message.answer(f"📊 Активні чати:\n{by_type}\n\nОстання перевірка: {last}{err}")
+    last_backup = await storage.get_meta(LAST_BACKUP_AT) or "ще не було"
+    err = f"\n⚠️ Остання помилка: {escape(watcher.last_error)}" if watcher.last_error else ""
+    await message.answer(
+        f"📊 Активні чати:\n{by_type}\n\n"
+        f"Версія: <code>{escape(config.bot_version)}</code>\n"
+        f"Запущено: {_fmt_time(started_at)} (аптайм {_fmt_uptime((kyiv_now() - started_at).total_seconds())})\n"
+        f"Остання перевірка каналу: {_fmt_time(watcher.last_check)}\n"
+        f"Остання вдала перевірка: {_fmt_time(watcher.last_success)}\n"
+        f"Останній бекап: {last_backup}{err}",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("backup"), F.chat.type == ChatType.PRIVATE)
+async def cmd_backup(message: Message, storage: Storage, bot: Bot, owner_ids: FrozenSet[int]) -> None:
+    """Власник: надіслати копію бази (усім власникам) просто зараз."""
+    if message.from_user.id not in owner_ids:
+        return
+    if not await send_backup(bot, storage, owner_ids):
+        await message.answer("⚠️ Не вдалося надіслати бекап — дивіться логи на сервері.")
 
 
 _KIND = {"channel": "📢", "group": "👥", "supergroup": "👥"}

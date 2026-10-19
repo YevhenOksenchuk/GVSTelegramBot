@@ -151,24 +151,30 @@ def parse_date(text: str, fallback: Optional[date] = None) -> Optional[date]:
         return fallback
 
 
+def unrecognized_lines(text: str) -> List[str]:
+    """Рядки з часом, які не вдалося прив'язати до підчерги, — ознака нового формату посту."""
+    matched = {m.group(0).strip() for m in _QUEUE_LINE.finditer(text) if parse_intervals(m.group(3))}
+    result: List[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line and line[0].isdigit() and _RANGE.search(line) and line not in matched:
+            result.append(line)
+    return result
+
+
 def parse_post(text: str, posted: Optional[date] = None) -> Optional[Schedule]:
     """Повертає Schedule, якщо пост схожий на графік ГПВ, інакше None."""
     lowered = text.lower()
     if not any(w in lowered for w in _NO_POWER_WORDS):
         return None
     queues: Dict[str, List[Interval]] = {}
-    matched_lines = set()
     for m in _QUEUE_LINE.finditer(text):
         queue, rest = f"{m.group(1)}.{m.group(2)}", m.group(3)
         intervals = parse_intervals(rest)
         if intervals or re.search(r"(не\s+відключа|без\s+відключ|світло\s+є)", rest, re.I):
             queues.setdefault(queue, []).extend(intervals)
-            matched_lines.add(m.group(0).strip())
-    # Рядок із часом, який не вдалося прив'язати до підчерги, — ознака нового формату посту
-    for line in text.splitlines():
-        line = line.strip()
-        if line and line[0].isdigit() and _RANGE.search(line) and line not in matched_lines:
-            log.warning("Не розпізнано рядок графіка: %r", line)
+    for line in unrecognized_lines(text):
+        log.warning("Не розпізнано рядок графіка: %r", line)
     if len(queues) < MIN_QUEUES:
         return None
     for q in QUEUES:

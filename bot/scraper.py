@@ -18,6 +18,7 @@ class Post:
     text: str
     posted_at: datetime
     url: str
+    has_photo: bool = False  # у пості є фото (графік могли викласти картинкою)
 
 
 def parse_channel_html(html: str) -> List[Post]:
@@ -37,6 +38,7 @@ def parse_channel_html(html: str) -> List[Post]:
             text=text_el.get_text().strip(),
             posted_at=datetime.fromisoformat(time_el["datetime"]),
             url=f"https://t.me/{ref}",
+            has_photo=msg.select_one(".tgme_widget_message_photo_wrap") is not None,
         ))
     return sorted(posts, key=lambda p: p.post_id)
 

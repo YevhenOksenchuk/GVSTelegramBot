@@ -28,6 +28,10 @@ CREATE TABLE IF NOT EXISTS access_requests (
     chat_id     INTEGER NOT NULL,  -- кому з власників надіслано запит
     message_id  INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS meta (
+    key    TEXT PRIMARY KEY,  -- службові позначки: last_backup_day тощо
+    value  TEXT
+);
 CREATE TABLE IF NOT EXISTS posts (
     post_id      INTEGER PRIMARY KEY,
     text_hash    TEXT NOT NULL,
@@ -97,6 +101,24 @@ class Storage:
         async with self.db.execute("SELECT title FROM chats WHERE chat_id=?", (chat_id,)) as cur:
             row = await cur.fetchone()
         return row[0] if row else None
+
+    async def get_chat_type(self, chat_id: int) -> Optional[str]:
+        async with self.db.execute("SELECT type FROM chats WHERE chat_id=?", (chat_id,)) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else None
+
+    # --- службові позначки ---
+    async def get_meta(self, key: str) -> Optional[str]:
+        async with self.db.execute("SELECT value FROM meta WHERE key=?", (key,)) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else None
+
+    async def set_meta(self, key: str, value: str) -> None:
+        await self.db.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        await self.db.commit()
 
     async def stats(self) -> List[Tuple[str, int]]:
         async with self.db.execute(

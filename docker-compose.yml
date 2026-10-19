@@ -1,6 +1,9 @@
 services:
   bot:
-    build: .
+    build:
+      context: .
+      args:
+        BOT_VERSION: "${BOT_VERSION:-dev}"
     env_file: .env
     volumes:
       - ./data:/app/data

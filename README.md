@@ -22,21 +22,23 @@ Hetzner CX22 (~4 €/міс), DigitalOcean, Contabo тощо. Система: **
 
 Підключитися до сервера можна з Mac через `ssh root@IP_СЕРВЕРА` або з айфона через застосунок Termius.
 
-## 3. Запустити (3 команди)
+## 3. Запустити (4 команди на сервері)
 
 ```bash
-# один раз: встановити Docker
-curl -fsSL https://get.docker.com | sh
-
-# скопіювати проєкт на сервер (з Mac):
-#   rsync -av --exclude .venv --exclude .idea --exclude .junie --exclude .pytest_cache ~/Desktop/GVSTelegramBot root@IP_СЕРВЕРА:/root/
-cd /root/GVSTelegramBot
-cp .env.example .env && nano .env      # вставити BOT_TOKEN та OWNER_ID
-
-docker compose up -d --build
+curl -fsSL https://get.docker.com | sh                        # один раз: Docker
+git clone https://github.com/YevhenOksenchuk/GVSTelegramBot.git /root/GVSTelegramBot
+cd /root/GVSTelegramBot && cp .env.example .env && nano .env   # вставити BOT_TOKEN та OWNER_ID
+./deploy.sh                                                   # збірка і запуск
 ```
 
-Логи: `docker compose logs -f`. Оновлення після змін коду: `docker compose up -d --build`.
+Логи: `docker compose logs -f` (вийти — Ctrl+C, бот працює далі).
+
+**Оновлення після змін коду** — одна команда на сервері:
+```bash
+/root/GVSTelegramBot/deploy.sh
+```
+Вона забирає код з GitHub (`git pull`), перезбирає й перезапускає бота, прибирає старі Docker-образи та показує
+останні логи. База `data/bot.db` і `.env` не чіпаються. Яка версія зараз працює — показує `/stats`.
 
 ## 4. Підключити канал і чат
 
@@ -63,6 +65,22 @@ docker compose up -d --build
 усім власникам, вирішити може будь-хто з них, і повідомлення з запитом оновиться в усіх. Кожен власник має
 один раз натиснути Start у боті, інакше бот не зможе йому написати.
 
+## Надійність
+
+- **Сповіщення власникам.** Бот пише всім власникам в особисті, якщо: не розпізнав рядок графіка (новий
+  формат посту), графік опубліковано картинкою, канал обленерго недоступний понад 10 хв (і коли знову
+  доступний), бот втратив доступ до каналу чи групи. Однакові сповіщення — не частіше ніж раз на годину.
+- **Бекап бази.** Щодня о `BACKUP_HOUR`:05 (за замовчуванням 04:05 за Києвом) бот надсилає `bot.db` кожному
+  власнику файлом; `/backup` — те саме на вимогу. Відновлення: покласти файл на сервер як
+  `/root/GVSTelegramBot/data/bot.db` і виконати `docker compose restart`.
+- **Сторожовий таймер.** Якщо цикл перевірки каналу завис або впав, бот сам завершується, а Docker
+  (`restart: unless-stopped`) одразу запускає його знову; власники отримують «🔁 Бот перезапускається».
+- **Зовнішній нагляд (необов'язково).** Якщо вимкнеться сам сервер, бот повідомити не зможе. Для цього є
+  безкоштовний [healthchecks.io](https://healthchecks.io): створіть check «lampochka» (Period 2 min,
+  Grace 5 min), у Integrations підключіть Telegram, скопіюйте Ping URL у `.env` як `HEALTHCHECK_URL=…`
+  і виконайте `docker compose restart`. Бот «відмічається» після кожної вдалої перевірки каналу; якщо
+  тиша триває понад 5 хв — healthchecks напише вам.
+
 ## Що сказати друзям
 
 > Напиши боту @ваш_бот `/start` — я підтверджу доступ, і графіки приходитимуть тобі в особисті.
@@ -78,6 +96,7 @@ docker compose up -d --build
 | `/stats` | кількість підключених чатів і стан перевірок (лише власник) |
 | `/users` | хто має доступ / чекає, кнопки дозволити й забрати (лише власник) |
 | `/post` | опублікувати актуальний графік у вибраний канал чи групу — кнопками (лише власник, в особистому чаті з ботом) |
+| `/backup` | надіслати копію бази всім власникам (лише власник) |
 
 ## Для розробки (Mac)
 
@@ -88,6 +107,10 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m bot.main         # запуск бота локально (потрібен .env)
 ```
 
+Тести також запускаються на GitHub після кожного push (вкладка Actions). Шрифт Inter (ліцензія OFL) лежить
+у `fonts/`, щоб картинка була однаковою на Mac і на сервері.
+
 Структура: `bot/scraper.py` читає канал, `parser.py` розбирає текст, `render.py` малює картинку,
 `formatter.py` формує підпис, `publisher.py` перевіряє канал і робить розсилку, `handlers.py` обробляє команди,
+`access.py` — приватний режим, `alerts.py` — сповіщення власникам, `maintenance.py` — бекапи,
 `storage.py` працює з SQLite (`data/bot.db`).
