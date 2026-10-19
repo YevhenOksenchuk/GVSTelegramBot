@@ -1,0 +1,209 @@
+"""Перевірка каналу-джерела й розсилка графіка підписникам."""
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import date, datetime
+from typing import Dict, List, Optional, Tuple
+
+import httpx
+from aiogram import Bot
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramMigrateToChat,
+    TelegramRetryAfter,
+)
+from aiogram.types import BufferedInputFile
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover
+    from backports.zoneinfo import ZoneInfo  # type: ignore
+
+from .formatter import format_caption
+from .parser import Schedule, parse_post
+from .render import render_schedule
+from .scraper import fetch_posts
+from .storage import Storage, text_hash
+
+log = logging.getLogger(__name__)
+KYIV = ZoneInfo("Europe/Kyiv")
+
+
+def kyiv_now() -> datetime:
+    return datetime.now(KYIV)
+
+
+def build_message(schedule: Schedule, url: str) -> Tuple[Optional[bytes], str]:
+    """(PNG, підпис). Якщо картинка не малюється — PNG = None, і піде лише текст."""
+    caption = format_caption(schedule, url)
+    try:
+        return render_schedule(schedule), caption
+    except Exception:
+        log.exception("Не вдалося намалювати графік на %s — надсилаю лише текст", schedule.date_label)
+        return None, caption
+
+
+def _parse(text: str, posted_at: datetime) -> Optional[Schedule]:
+    published = posted_at.astimezone(KYIV)
+    schedule = parse_post(text, published.date())
+    if schedule:
+        schedule.published = published
+    return schedule
+
+
+async def load_schedule(
+    storage: Storage, post_id: int, text: str, posted_at: datetime, prev_text: Optional[str] = None
+) -> Optional[Schedule]:
+    """Розбирає пост і порівнює з попередньою версією графіка на ту саму дату.
+
+    prev_text — старий текст цього ж посту, якщо його відредагували.
+    """
+    schedule = _parse(text, posted_at)
+    if not schedule:
+        return None
+    candidates = [(prev_text, posted_at.isoformat())] if prev_text else []
+    candidates += await storage.schedule_posts_before(post_id)
+    for old_text, old_posted in candidates:
+        previous = _parse(old_text, datetime.fromisoformat(old_posted))
+        if previous and previous.day == schedule.day:
+            schedule.mark_changes(previous)
+            break
+    return schedule
+
+
+async def has_newer_for_day(storage: Storage, post_id: int, schedule: Schedule) -> bool:
+    """Чи є новіший пост з графіком на ту саму дату (тоді правка старого посту неактуальна)."""
+    for text, posted_at in await storage.schedule_posts_after(post_id):
+        newer = _parse(text, datetime.fromisoformat(posted_at))
+        if newer and newer.day == schedule.day:
+            return True
+    return False
+
+
+async def current_schedules(storage: Storage) -> List[Tuple[Schedule, str]]:
+    """Актуальні графіки: найсвіжіший на кожну дату від сьогодні, за зростанням дати.
+
+    Якщо таких немає — останній відомий графік.
+    """
+    today = kyiv_now().date()
+    latest: Dict[date, Tuple[Schedule, str]] = {}
+    fallback: Optional[Tuple[Schedule, str]] = None
+    for post_id, text, url, posted_at in await storage.recent_schedule_posts():
+        schedule = await load_schedule(storage, post_id, text, datetime.fromisoformat(posted_at))
+        if not schedule:
+            continue
+        fallback = fallback or (schedule, url)
+        if schedule.day and schedule.day >= today and schedule.day not in latest:
+            latest[schedule.day] = (schedule, url)
+    if latest:
+        return [latest[d] for d in sorted(latest)]
+    return [fallback] if fallback else []
+
+
+async def send_schedule(
+    bot: Bot, storage: Storage, chat_id: int, png: Optional[bytes], caption: str
+) -> bool:
+    for _ in range(3):
+        try:
+            if png is None:
+                await bot.send_message(chat_id, caption, parse_mode="HTML", disable_web_page_preview=True)
+            else:
+                await bot.send_photo(
+                    chat_id,
+                    BufferedInputFile(png, filename="grafik.png"),
+                    caption=caption,
+                    parse_mode="HTML",
+                )
+            return True
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except TelegramMigrateToChat as e:
+            await storage.migrate_chat(chat_id, e.migrate_to_chat_id)
+            chat_id = e.migrate_to_chat_id
+        except TelegramForbiddenError:
+            log.info("Чат %s заблокував бота — деактивую", chat_id)
+            await storage.deactivate_chat(chat_id)
+            return False
+        except TelegramBadRequest as e:
+            if "chat not found" in str(e).lower() or "not enough rights" in str(e).lower():
+                log.info("Чат %s недоступний (%s) — деактивую", chat_id, e)
+                await storage.deactivate_chat(chat_id)
+            else:
+                log.warning("Не вдалося надіслати в %s: %s", chat_id, e)
+            return False
+        except Exception:  # мережа тощо — пропускаємо цей чат, решта отримає
+            log.exception("Помилка надсилання в %s", chat_id)
+            return False
+    return False
+
+
+async def publish_current(bot: Bot, storage: Storage, chat_id: int) -> int:
+    """Надіслати в чат актуальні графіки (сьогодні й завтра). Повертає кількість надісланих."""
+    sent = 0
+    for schedule, url in await current_schedules(storage):
+        png, caption = build_message(schedule, url)
+        if await send_schedule(bot, storage, chat_id, png, caption):
+            sent += 1
+    return sent
+
+
+async def broadcast(bot: Bot, storage: Storage, schedule: Schedule, url: str) -> int:
+    png, caption = build_message(schedule, url)
+    sent = 0
+    for chat_id in await storage.active_chats():
+        if await send_schedule(bot, storage, chat_id, png, caption):
+            sent += 1
+        await asyncio.sleep(0.05)
+    log.info("Графік на %s розіслано в %d чатів", schedule.date_label, sent)
+    return sent
+
+
+class Watcher:
+    def __init__(self, bot: Bot, storage: Storage, channel: str, interval: int):
+        self.bot, self.storage, self.channel, self.interval = bot, storage, channel, interval
+        self.last_check: Optional[datetime] = None
+        self.last_error: Optional[str] = None
+
+    async def check_once(self, client: httpx.AsyncClient) -> None:
+        first_run = not await self.storage.has_any_posts()
+        to_publish = {}  # дата -> (графік, посилання): по одному, найсвіжішому, на кожну дату
+        for post in await fetch_posts(client, self.channel):
+            old_hash = await self.storage.get_post_hash(post.post_id)
+            if old_hash == text_hash(post.text):
+                continue
+            prev_text = await self.storage.get_post_text(post.post_id) if old_hash else None
+            schedule = await load_schedule(
+                self.storage, post.post_id, post.text, post.posted_at, prev_text
+            )
+            await self.storage.save_post(
+                post.post_id, post.text, post.url, post.posted_at.isoformat(), schedule is not None
+            )
+            if first_run or schedule is None:
+                continue
+            if schedule.day and schedule.day < kyiv_now().date():
+                continue  # старий графік — не спамимо
+            if schedule.has_previous and not schedule.changed:
+                continue  # той самий графік (правка тексту або повтор) — не дублюємо
+            if old_hash and await has_newer_for_day(self.storage, post.post_id, schedule):
+                continue  # відредагували старий пост, а на цю дату вже є новіший графік
+            to_publish.pop(schedule.day, None)
+            to_publish[schedule.day] = (schedule, post.url)
+        if first_run:
+            log.info("Перший запуск: наявні пости позначено як прочитані")
+        # Кілька постів за одну перевірку: на кожну дату шлемо лише найсвіжіший, у порядку публікації.
+        for schedule, url in to_publish.values():
+            await broadcast(self.bot, self.storage, schedule, url)
+
+    async def run(self) -> None:
+        async with httpx.AsyncClient() as client:
+            while True:
+                try:
+                    await self.check_once(client)
+                    self.last_error = None
+                except Exception as e:  # мережа, зміна верстки тощо — не падаємо
+                    self.last_error = f"{type(e).__name__}: {e}"
+                    log.exception("Помилка перевірки каналу")
+                self.last_check = kyiv_now()
+                await asyncio.sleep(self.interval)
