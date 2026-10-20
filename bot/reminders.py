@@ -181,12 +181,12 @@ def format_chat_reminder(start: datetime, items: List[QueueEnd], now: datetime, 
     when = "вже зараз" if left <= 0 else f"через {left} хв"
     queues = [q for q, _ in items]
     ends = sorted({e for _, e in items})
-    lines = [f"⚡ <b>{_queues_label(queues)}</b> — без світла {when}"]
+    lines = [f"💡 <b>{_queues_label(queues)}</b> — без світла {when}", ""]
     since = _hm(start) + _day_word(start, now)
     if len(ends) == 1:
-        lines.append(f"Електроенергія буде відсутня з {since} до {_end_label(start, ends[0])}")
+        lines.append(f"Електроенергії не буде з {since} до {_end_label(start, ends[0])}")
     else:
-        lines.append(f"Електроенергія буде відсутня з {since}:")
+        lines.append(f"Електроенергії не буде з {since}:")
         for end in ends:
             same = [q for q, e in items if e == end]
             lines.append(f"• {', '.join(same)} — до {_end_label(start, end)}")
