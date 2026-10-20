@@ -77,6 +77,13 @@ CREATE TABLE IF NOT EXISTS reminders_sent (
     sent_at   TEXT DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (user_id, kind, event_at)
 );
+CREATE TABLE IF NOT EXISTS chat_reminders_sent (
+    chat_id   INTEGER NOT NULL,   -- канал/група
+    queue     TEXT NOT NULL,      -- підчерга, про яку вже попередили
+    event_at  TEXT NOT NULL,      -- початок відключення (ISO, Київ)
+    sent_at   TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (chat_id, queue, event_at)
+);
 """
 
 # Колонки, додані пізніше за створення таблиці (для баз, що вже існують)
@@ -84,6 +91,8 @@ _CHAT_COLUMNS = (
     ("pinned_message_id", "INTEGER"),               # останнє закріплене ботом повідомлення
     ("pin_enabled", "INTEGER NOT NULL DEFAULT 1"),  # чи закріплювати графіки в цьому чаті
     ("pin_failed_at", "TEXT"),                      # коли востаннє не вдалося (немає прав) — не повторюємо 24 год
+    ("username", "TEXT"),                           # публічний @username чату — для посилань на графік
+    ("remind_lead", "INTEGER NOT NULL DEFAULT 0"),  # нагадування в чат за N хв до відключення; 0 = вимкнено
 )
 
 
@@ -115,11 +124,13 @@ class Storage:
             await self.db.close()
 
     # --- чати ---
-    async def add_chat(self, chat_id: int, title: str, type_: str, added_by: Optional[int]) -> None:
+    async def add_chat(self, chat_id: int, title: str, type_: str, added_by: Optional[int],
+                       username: Optional[str] = None) -> None:
         await self.db.execute(
-            """INSERT INTO chats (chat_id, title, type, added_by, active) VALUES (?, ?, ?, ?, 1)
-               ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, type=excluded.type, active=1""",
-            (chat_id, title, type_, added_by),
+            """INSERT INTO chats (chat_id, title, type, added_by, active, username) VALUES (?, ?, ?, ?, 1, ?)
+               ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, type=excluded.type, active=1,
+                   username=COALESCE(excluded.username, chats.username)""",
+            (chat_id, title, type_, added_by, username),
         )
         await self.db.commit()
 
@@ -389,8 +400,60 @@ class Storage:
             return [r[0] for r in await cur.fetchall()]
 
     async def prune_reminders(self, days: int = 3) -> None:
-        await self.db.execute("DELETE FROM reminders_sent WHERE sent_at < datetime('now', ?)", (f"-{days} days",))
+        for table in ("reminders_sent", "chat_reminders_sent"):
+            await self.db.execute(f"DELETE FROM {table} WHERE sent_at < datetime('now', ?)", (f"-{days} days",))
         await self.db.commit()
+
+    # --- нагадування в каналах і групах ---
+    async def set_chat_username(self, chat_id: int, username: Optional[str]) -> None:
+        await self.db.execute("UPDATE chats SET username=? WHERE chat_id=?", (username, chat_id))
+        await self.db.commit()
+
+    async def set_remind_lead(self, chat_id: int, lead: int) -> None:
+        await self.db.execute("UPDATE chats SET remind_lead=? WHERE chat_id=?", (lead, chat_id))
+        await self.db.commit()
+
+    async def connected_chats_reminders(self) -> List[Tuple[int, str, str, int]]:
+        """(chat_id, title, type, remind_lead) активних каналів і груп."""
+        async with self.db.execute(
+            "SELECT chat_id, title, type, remind_lead FROM chats WHERE active=1 AND type != 'private' "
+            "ORDER BY type, title"
+        ) as cur:
+            return [(r[0], r[1], r[2], r[3]) for r in await cur.fetchall()]
+
+    async def chats_with_reminders(self) -> List[Tuple[int, str, Optional[str], int]]:
+        """(chat_id, type, username, remind_lead) чатів, де нагадування увімкнено."""
+        async with self.db.execute(
+            "SELECT chat_id, type, username, remind_lead FROM chats WHERE active=1 AND remind_lead > 0"
+        ) as cur:
+            return [(r[0], r[1], r[2], r[3]) for r in await cur.fetchall()]
+
+    async def chat_reminder_sent(self, chat_id: int, queue: str, event_at: str) -> bool:
+        async with self.db.execute(
+            "SELECT 1 FROM chat_reminders_sent WHERE chat_id=? AND queue=? AND event_at=?", (chat_id, queue, event_at)
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    async def mark_chat_reminder(self, chat_id: int, queues: List[str], event_at: str) -> None:
+        await self.db.executemany(
+            "INSERT OR IGNORE INTO chat_reminders_sent (chat_id, queue, event_at) VALUES (?, ?, ?)",
+            [(chat_id, q, event_at) for q in queues],
+        )
+        await self.db.commit()
+
+    async def latest_sent_message(self, chat_id: int, day: Optional[str] = None) -> Optional[int]:
+        """message_id останнього графіка бота в чаті (за день, якщо є; інакше будь-який)."""
+        for condition, params in ((" AND day=?", (chat_id, day)), ("", (chat_id,))):
+            if condition and not day:
+                continue
+            async with self.db.execute(
+                f"SELECT message_id FROM sent_messages WHERE chat_id=? AND day IS NOT NULL{condition} "
+                "ORDER BY id DESC LIMIT 1", params,
+            ) as cur:
+                row = await cur.fetchone()
+            if row:
+                return row[0]
+        return None
 
     # --- пости ---
     async def has_any_posts(self) -> bool:

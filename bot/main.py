@@ -92,6 +92,7 @@ async def main() -> None:
                 BotCommand(command="stats", description="Стан бота"),
                 BotCommand(command="fix", description="Перевидати графік у надісланих повідомленнях"),
                 BotCommand(command="pin", description="Закріплення графіка по чатах"),
+                BotCommand(command="remind", description="Нагадування в канали/групи перед відключенням"),
                 BotCommand(command="backup", description="Надіслати бекап бази"),
             ], scope=BotCommandScopeChat(chat_id=owner))
         except Exception as e:  # власник ще не натискав Start

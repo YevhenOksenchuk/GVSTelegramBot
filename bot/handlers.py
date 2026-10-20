@@ -16,6 +16,7 @@ from .config import Config
 from .maintenance import LAST_BACKUP_AT, send_backup
 from .parser import date_label
 from .publisher import Watcher, fix_messages, kyiv_now, publish_announcement, publish_current
+from .reminders import LEAD_OPTIONS
 from .storage import Storage
 
 router = Router()
@@ -54,7 +55,7 @@ async def on_my_member(event: ChatMemberUpdated, storage: Storage, bot: Bot, own
             pass
         return
     was_active = await storage.is_active(chat.id)
-    await storage.add_chat(chat.id, _title(chat), chat.type, event.from_user.id)
+    await storage.add_chat(chat.id, _title(chat), chat.type, event.from_user.id, getattr(chat, "username", None))
     if was_active:
         # Змінили права в уже підключеному чаті — можливо, дали право закріплювати: спробуємо знову
         await storage.set_pin_failed(chat.id, None)
@@ -92,7 +93,7 @@ async def cmd_start(message: Message, storage: Storage, bot: Bot, owner_ids: Fro
         if not allowed:
             await message.answer("🔒 Бот приватний. Напишіть мені в особисті /start, щоб попросити доступ.")
             return
-    await storage.add_chat(chat.id, _title(chat), chat.type, user.id)
+    await storage.add_chat(chat.id, _title(chat), chat.type, user.id, getattr(chat, "username", None))
     if chat.type != ChatType.PRIVATE:
         await message.answer("✅ Графіки ГПВ надходитимуть у цей чат. Вимкнути: /stop")
         return
@@ -249,6 +250,64 @@ async def on_pin_button(cb: CallbackQuery, storage: Storage, owner_ids: FrozenSe
         publisher.ALERTS.reset(f"pin:{chat_id}")
     await cb.message.edit_reply_markup(reply_markup=await _pin_keyboard(storage))
     await cb.answer("Закріплення вимкнено" if enabled else "Закріплення увімкнено")
+
+
+async def _remind_keyboard(storage: Storage) -> InlineKeyboardMarkup:
+    chats = await storage.connected_chats_reminders()
+    if not chats:
+        return _owner_keyboard([[("Немає підключених каналів чи груп", "rem:none")]])
+    return _owner_keyboard([
+        [(f"{'✅ за ' + str(lead) + ' хв' if lead else '❌'} · {_KIND.get(type_, '')} {title}", f"rem:pick:{chat_id}")]
+        for chat_id, title, type_, lead in chats
+    ])
+
+
+@router.message(Command("remind"), F.chat.type == ChatType.PRIVATE)
+async def cmd_remind(message: Message, storage: Storage, owner_ids: FrozenSet[int]) -> None:
+    """Власник: нагадування в канали/групи про найближчі відключення (усі черги одним повідомленням)."""
+    if message.from_user.id not in owner_ids:
+        return
+    await message.answer(
+        "⏰ Нагадування в чат за N хвилин до відключення — одне повідомлення на всі черги, що вимикаються "
+        "в один час. Натисніть чат, щоб увімкнути, змінити час або вимкнути.",
+        reply_markup=await _remind_keyboard(storage),
+    )
+
+
+@router.callback_query(F.data.startswith("rem:"))
+async def on_remind_button(cb: CallbackQuery, storage: Storage, owner_ids: FrozenSet[int]) -> None:
+    if cb.from_user.id not in owner_ids:
+        await cb.answer("Лише для власника бота", show_alert=True)
+        return
+    parts = cb.data.split(":")
+    action = parts[1]
+    if action == "none":
+        await cb.answer()
+        return
+    if action == "list":
+        await cb.message.edit_reply_markup(reply_markup=await _remind_keyboard(storage))
+        await cb.answer()
+        return
+    chat_id = int(parts[2])
+    title = escape(await storage.get_chat_title(chat_id) or str(chat_id))
+    if action == "pick":
+        rows = [[(f"за {m} хв", f"rem:set:{chat_id}:{m}") for m in LEAD_OPTIONS],
+                [("❌ Вимкнути", f"rem:set:{chat_id}:0"), ("← Назад", "rem:list")]]
+        await cb.message.edit_text(f"⏰ <b>{title}</b>: за скільки хвилин нагадувати?", parse_mode="HTML",
+                                   reply_markup=_owner_keyboard(rows))
+        await cb.answer()
+        return
+    if action == "set":
+        lead = int(parts[3])
+        if lead and lead not in LEAD_OPTIONS:
+            await cb.answer()
+            return
+        await storage.set_remind_lead(chat_id, lead)
+        await cb.message.edit_text(
+            "⏰ Нагадування в чат за N хвилин до відключення. Натисніть чат, щоб змінити.",
+            reply_markup=await _remind_keyboard(storage),
+        )
+        await cb.answer(f"{title}: нагадування за {lead} хв" if lead else f"{title}: нагадування вимкнено")
 
 
 @router.message(Command("fix"), F.chat.type == ChatType.PRIVATE)

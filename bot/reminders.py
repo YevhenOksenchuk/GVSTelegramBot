@@ -14,6 +14,7 @@ from typing import Dict, FrozenSet, List, Optional, Tuple
 
 from aiogram import Bot
 
+from .parser import QUEUES
 from .publisher import KYIV, kyiv_now, latest_by_day
 from .storage import Storage
 
@@ -127,10 +128,110 @@ async def run_once(bot: Bot, storage: Storage, owner_ids: FrozenSet[int], now: O
     return sent
 
 
+# ---------------------------------------------------------------------------
+# Нагадування в каналах і групах: одне повідомлення на всі черги, що вимикаються в один час
+# ---------------------------------------------------------------------------
+
+QueueEnd = Tuple[str, datetime]  # (підчерга, кінець відключення)
+_USERNAME_CHECKED: set = set()   # чати, для яких уже пробували дізнатися @username
+
+
+def chat_due_groups(by_day: Dict[date, object], days, now: datetime, lead_minutes: int
+                    ) -> List[Tuple[datetime, List[QueueEnd]]]:
+    """[(початок, [(черга, кінець), ...]), ...] — відключення, про які час нагадати саме зараз."""
+    lead = timedelta(minutes=lead_minutes)
+    groups: Dict[datetime, List[QueueEnd]] = {}
+    for queue in QUEUES:
+        for s, e in absolute_intervals(by_day, queue, days):
+            if s - lead <= now < s:
+                groups.setdefault(s, []).append((queue, e))
+    return [(s, groups[s]) for s in sorted(groups)]
+
+
+def message_link(chat_id: int, chat_type: str, username: Optional[str], message_id: Optional[int]) -> Optional[str]:
+    """Посилання на повідомлення бота в чаті (публічний — через @username, приватний — через t.me/c/)."""
+    if not message_id:
+        return None
+    if username:
+        return f"https://t.me/{username}/{message_id}"
+    if chat_type in ("channel", "supergroup") and str(chat_id).startswith("-100"):
+        return f"https://t.me/c/{str(chat_id)[4:]}/{message_id}"
+    return None  # у звичайній групі посилань на повідомлення немає
+
+
+def _end_label(start: datetime, end: datetime) -> str:
+    if end.date() == start.date():
+        return _hm(end)
+    if end.time() == time(0) and end.date() == start.date() + timedelta(days=1):
+        return "24:00"
+    return f"{_hm(end)} наступного дня"
+
+
+def _queues_label(queues: List[str]) -> str:
+    return ("Черга " if len(queues) == 1 else "Черги ") + ", ".join(queues)
+
+
+def format_chat_reminder(start: datetime, items: List[QueueEnd], now: datetime, link: Optional[str]) -> str:
+    left = int((start - now).total_seconds() // 60)
+    when = "вже зараз" if left <= 0 else f"через {left} хв"
+    queues = [q for q, _ in items]
+    ends = sorted({e for _, e in items})
+    lines = [f"⚡ <b>{_queues_label(queues)}</b> — без світла {when}"]
+    since = _hm(start) + _day_word(start, now)
+    if len(ends) == 1:
+        lines.append(f"Електроенергія буде відсутня з {since} до {_end_label(start, ends[0])}")
+    else:
+        lines.append(f"Електроенергія буде відсутня з {since}:")
+        for end in ends:
+            same = [q for q, e in items if e == end]
+            lines.append(f"• {', '.join(same)} — до {_end_label(start, end)}")
+    if link:
+        lines += ["", f'📋 <a href="{link}">Переглянути актуальний графік</a>']
+    return "\n".join(lines)
+
+
+async def run_chat_reminders_once(bot: Bot, storage: Storage, now: Optional[datetime] = None) -> int:
+    """Нагадування в канали/групи, де їх увімкнено (/remind). Повертає кількість надісланих повідомлень."""
+    now = now or kyiv_now()
+    chats = await storage.chats_with_reminders()
+    if not chats:
+        return 0
+    by_day = await latest_by_day(storage)
+    today = now.date()
+    days = (today - timedelta(days=1), today, today + timedelta(days=1))
+    sent = 0
+    for chat_id, chat_type, username, lead in chats:
+        if username is None and chat_id not in _USERNAME_CHECKED:  # старі записи без @username — дізнаємось раз
+            _USERNAME_CHECKED.add(chat_id)
+            try:
+                username = getattr(await bot.get_chat(chat_id), "username", None)
+                if username:
+                    await storage.set_chat_username(chat_id, username)
+            except Exception as e:
+                log.info("Не вдалося отримати username чату %s: %s", chat_id, e)
+        for start, items in chat_due_groups(by_day, days, now, lead):
+            key = start.isoformat(timespec="minutes")
+            fresh = [(q, e) for q, e in items if not await storage.chat_reminder_sent(chat_id, q, key)]
+            if not fresh:
+                continue
+            link = message_link(chat_id, chat_type, username,
+                                await storage.latest_sent_message(chat_id, start.date().isoformat()))
+            try:
+                await bot.send_message(chat_id, format_chat_reminder(start, fresh, now, link),
+                                       parse_mode="HTML", disable_web_page_preview=True)
+            except Exception as e:
+                log.warning("Не вдалося надіслати нагадування в чат %s: %s", chat_id, e)
+                continue
+            await storage.mark_chat_reminder(chat_id, [q for q, _ in fresh], key)
+            sent += 1
+    return sent
+
+
 async def reminders_loop(bot: Bot, storage: Storage, owner_ids: FrozenSet[int]) -> None:
     while True:
         try:
             await run_once(bot, storage, owner_ids)
+            await run_chat_reminders_once(bot, storage)
             await storage.prune_reminders()
         except Exception:
             log.exception("Помилка нагадувань")
