@@ -134,6 +134,11 @@ async def run_once(bot: Bot, storage: Storage, owner_ids: FrozenSet[int], now: O
 
 QueueEnd = Tuple[str, datetime]  # (підчерга, кінець відключення)
 _USERNAME_CHECKED: set = set()   # чати, для яких уже пробували дізнатися @username
+QUIET_HOURS = (0, 5)             # «комендантська година»: нагадування в чати без звуку з 00:00 до 05:00
+
+
+def is_quiet(now: datetime) -> bool:
+    return QUIET_HOURS[0] <= now.hour < QUIET_HOURS[1]
 
 
 def chat_due_groups(by_day: Dict[date, object], days, now: datetime, lead_minutes: int
@@ -218,7 +223,8 @@ async def run_chat_reminders_once(bot: Bot, storage: Storage, now: Optional[date
                                 await storage.latest_sent_message(chat_id, start.date().isoformat()))
             try:
                 await bot.send_message(chat_id, format_chat_reminder(start, fresh, now, link),
-                                       parse_mode="HTML", disable_web_page_preview=True)
+                                       parse_mode="HTML", disable_web_page_preview=True,
+                                       disable_notification=is_quiet(now))
             except Exception as e:
                 log.warning("Не вдалося надіслати нагадування в чат %s: %s", chat_id, e)
                 continue

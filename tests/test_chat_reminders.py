@@ -62,6 +62,11 @@ def test_run_chat_reminders_once(tmp_path):
             assert bot.messages[-1][1].startswith("⚡ <b>Черга 3.1</b> — без світла через 3 хв\n"
                                                   "Електроенергія буде відсутня з 09:00 до 10:00")
             assert all(chat_id == -1001 for chat_id, _ in bot.messages)  # у групі без /remind — тиша
+            assert bot.silent == [False, False]
+            # «комендантська година» 00:00–05:00: нагадування без звуку
+            assert await reminders.run_chat_reminders_once(bot, storage, at(9, 2, 50)) == 1  # 3.1 о 03:00
+            assert bot.messages[-1][1].startswith("⚡ <b>Черга 3.1</b> — без світла через 10 хв") and bot.silent[-1]
+            assert reminders.is_quiet(at(9, 4, 59)) and not reminders.is_quiet(at(9, 5)) and not reminders.is_quiet(at(9, 23, 59))
         finally:
             await storage.close()
 

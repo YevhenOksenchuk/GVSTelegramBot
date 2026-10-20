@@ -27,10 +27,11 @@ def schedule_text(day, q11=Q11, updated=False):
 
 class FakeBot:
     def __init__(self):
-        self.messages, self.photos = [], []
+        self.messages, self.photos, self.silent = [], [], []
 
     async def send_message(self, chat_id, text, **kw):
         self.messages.append((chat_id, text))
+        self.silent.append(bool(kw.get("disable_notification")))
         return SimpleNamespace(message_id=len(self.messages))
 
     async def send_photo(self, chat_id, photo, caption, parse_mode):
