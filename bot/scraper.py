@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 import httpx
 from bs4 import BeautifulSoup
@@ -43,9 +43,11 @@ def parse_channel_html(html: str) -> List[Post]:
     return sorted(posts, key=lambda p: p.post_id)
 
 
-async def fetch_posts(client: httpx.AsyncClient, channel: str) -> List[Post]:
+async def fetch_posts(client: httpx.AsyncClient, channel: str, before: Optional[int] = None) -> List[Post]:
+    """Останні ~20 постів каналу; з before=<post_id> — сторінка старіших постів (для історії)."""
     resp = await client.get(
         f"https://t.me/s/{channel}",
+        params={"before": before} if before else None,
         headers={"User-Agent": USER_AGENT},
         timeout=20,
         follow_redirects=True,

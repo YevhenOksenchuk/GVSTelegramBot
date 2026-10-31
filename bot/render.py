@@ -8,12 +8,12 @@ from typing import List, Optional
 
 from PIL import Image, ImageDraw, ImageFont
 
-from .parser import QUEUES, Schedule
+from .parser import QUEUES, Schedule, _merge
 
 W = 1080
 PAD = 40
 LABEL_W = 96
-TOTAL_W = 120
+TOTAL_W = 160  # права колонка: «6 год» за день і «за місяць 150» під ним
 ROW_H = 96
 BAR_H = 36
 ROW_GAP = 8
@@ -94,14 +94,14 @@ def _row_positions() -> List[int]:
     return ys
 
 
-def render_schedule(schedule: Schedule) -> bytes:
-    """Повертає PNG з графіком."""
+def render_schedule(schedule: Schedule, month=None) -> bytes:
+    """Повертає PNG з графіком. month — stats.MonthStats: додає підсумок за місяць по чергах і внизу."""
     rows = _row_positions()
     grid_h = rows[-1] + ROW_H
     top = HEADER_H + SCALE_H
     bottom = top + grid_h
     extra_legend = bool(schedule.changed or schedule.cutoff)
-    H = bottom + SCALE_H + FOOTER_H + (LEGEND_ROW if extra_legend else 0)
+    H = bottom + SCALE_H + FOOTER_H + (LEGEND_ROW if extra_legend else 0) + (LEGEND_ROW if month else 0)
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
 
@@ -160,7 +160,10 @@ def render_schedule(schedule: Schedule) -> bytes:
         bar_top, bar_bot = y + 12, y + 12 + BAR_H
         d.text((PAD + 18, bar_top + BAR_H / 2), q, font=_font(30, True), fill=TEXT, anchor="lm")
         if q in schedule.changed:
-            d.text((W - PAD - 18, bar_bot + 10), "змінено", font=_font(20, True), fill=NOW, anchor="ra")
+            d.text((PAD + 18, bar_bot + 10), "змінено", font=_font(18, True), fill=NOW)
+        if month is not None:  # накопичено за місяць, що йде
+            d.text((W - PAD - 18, bar_bot + 10), f"за місяць {round(month.per_queue[q] / 60)}",
+                   font=_font(20), fill=MUTED, anchor="ra")
 
         d.rounded_rectangle((x0, bar_top, x1, bar_bot), radius=8, fill=ON, outline=ON_EDGE)
         if cut:  # минула частина дня — притемнена
@@ -217,7 +220,9 @@ def render_schedule(schedule: Schedule) -> bytes:
                 d.line((tx, ty + size * 0.62, tx + tw, ty + size * 0.62), fill=color, width=2)
             tx += tw
 
-        total = schedule.off_minutes(q)
+        # За день — разом із годинами, що вже минули до оновлення (їх у новому тексті вже немає)
+        effective = _merge(schedule.past_from_previous(q) + intervals)
+        total = sum(e_ - s_ for s_, e_ in effective)
         d.text((W - PAD - 18, bar_top + BAR_H / 2), _fmt_hours(total) if total else "—",
                font=_font(26, True), fill=OFF if total else MUTED, anchor="rm")
 
@@ -228,7 +233,7 @@ def render_schedule(schedule: Schedule) -> bytes:
     lx = PAD + 300
     d.rounded_rectangle((lx, ly, lx + 36, ly + 26), radius=6, fill=ON, outline=ON_EDGE)
     d.text((lx + 48, ly + 13), "світло є", font=_font(26), fill=TEXT, anchor="lm")
-    d.text((W - PAD - 18, ly + 13), "год — сумарно без світла", font=_font(24), fill=MUTED, anchor="rm")
+    d.text((W - PAD - 18, ly + 13), "год — без світла за день", font=_font(24), fill=MUTED, anchor="rm")
     if extra_legend:
         ly += LEGEND_ROW
         lx = PAD
@@ -242,6 +247,15 @@ def render_schedule(schedule: Schedule) -> bytes:
         if cut:
             d.rounded_rectangle((lx, ly, lx + 36, ly + 26), radius=6, fill=PAST, outline=ON_EDGE)
             d.text((lx + 48, ly + 13), f"минуло (до {_hhmm(cut)})", font=_font(26), fill=TEXT, anchor="lm")
+    if month is not None:
+        from .stats import MONTH_LOC  # тут, а не вгорі: stats сам імпортує render
+
+        ly += LEGEND_ROW
+        per_day = month.avg_minutes / 60 / max(1, month.days_covered)
+        d.text((PAD, ly + 13),
+               f"У {MONTH_LOC[month.month]}{month.since_label}: у середньому "
+               f"{month.avg_minutes / 60:.0f} год на чергу  ·  {per_day:.1f} год/день".replace(".", ","),
+               font=_font(24), fill=SUBTLE, anchor="lm")
 
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)

@@ -16,6 +16,7 @@ from .alerts import Alerts
 from .config import load_config
 from .handlers import router
 from .maintenance import backup_loop
+from .monthly import router as monthly_router
 from .myqueue import router as myqueue_router
 from .publisher import Watcher, kyiv_now
 from .reminders import reminders_loop
@@ -68,6 +69,7 @@ async def main() -> None:
     dp["started_at"] = started_at
     dp.include_router(access_router)
     dp.include_router(myqueue_router)
+    dp.include_router(monthly_router)
     dp.include_router(router)
     logging.info("Версія: %s", cfg.bot_version)
     if not cfg.owner_ids:
@@ -87,6 +89,7 @@ async def main() -> None:
         try:
             await bot.set_my_commands(commands + [
                 BotCommand(command="my", description="Моя черга і нагадування"),
+                BotCommand(command="month", description="Підсумок без світла за місяць"),
                 BotCommand(command="post", description="Опублікувати графік у канал/групу"),
                 BotCommand(command="users", description="Хто має доступ"),
                 BotCommand(command="stats", description="Стан бота"),

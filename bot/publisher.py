@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from html import escape
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
@@ -29,6 +29,7 @@ from .formatter import format_caption
 from .parser import Schedule, parse_post, unrecognized_lines
 from .render import render_schedule
 from .scraper import Post, fetch_posts
+from .stats import MonthStats, month_stats
 from .storage import Storage, text_hash
 
 log = logging.getLogger(__name__)
@@ -51,14 +52,28 @@ def kyiv_now() -> datetime:
     return datetime.now(KYIV)
 
 
-def build_message(schedule: Schedule, url: str) -> Tuple[Optional[bytes], str]:
+def build_message(schedule: Schedule, url: str, month: Optional[MonthStats] = None) -> Tuple[Optional[bytes], str]:
     """(PNG, підпис). Якщо картинка не малюється — PNG = None, і піде лише текст."""
     caption = format_caption(schedule, url)
     try:
-        return render_schedule(schedule), caption
+        return render_schedule(schedule, month), caption
     except Exception:
         log.exception("Не вдалося намалювати графік на %s — надсилаю лише текст", schedule.date_label)
         return None, caption
+
+
+async def month_for(storage: Storage, schedule: Schedule) -> Optional[MonthStats]:
+    """Підсумок за місяць дати графіка (по день графіка включно) — для правої колонки картинки."""
+    try:
+        day = schedule.day or kyiv_now().date()
+        rows = await storage.all_schedule_posts()
+        schedules = [s for s in (_parse(text, datetime.fromisoformat(posted)) for _, text, _, posted in rows) if s]
+        earliest = await storage.earliest_post_date()
+        data_start = datetime.fromisoformat(earliest).astimezone(KYIV).date() if earliest else None
+        return month_stats(schedules, day.year, day.month, max(kyiv_now().date(), day), data_start)
+    except Exception:
+        log.exception("Не вдалося порахувати статистику за місяць")
+        return None
 
 
 def _parse(text: str, posted_at: datetime) -> Optional[Schedule]:
@@ -232,7 +247,7 @@ async def publish_current(bot: Bot, storage: Storage, chat_id: int, pin: bool = 
     my_queue = prefs[0] if prefs else None
     sent, last_id = 0, None
     for schedule, url in await current_schedules(storage):
-        png, caption = build_message(schedule, url)
+        png, caption = build_message(schedule, url, await month_for(storage, schedule))
         if my_queue:
             caption = format_caption(schedule, url, my_queue=my_queue)
         message_id = await send_schedule(bot, storage, chat_id, png, caption, schedule.post_id, schedule.day)
@@ -244,7 +259,7 @@ async def publish_current(bot: Bot, storage: Storage, chat_id: int, pin: bool = 
 
 
 async def broadcast(bot: Bot, storage: Storage, schedule: Schedule, url: str) -> int:
-    png, caption = build_message(schedule, url)
+    png, caption = build_message(schedule, url, await month_for(storage, schedule))
     my_queues = {user_id: queue for user_id, queue, _, _ in await storage.all_prefs()}
     sent = 0
     for chat_id, chat_type in await storage.active_chats_typed():
@@ -269,7 +284,7 @@ async def fix_messages(bot: Bot, storage: Storage, day: date) -> Tuple[int, List
     if not found:
         return 0, [("—", "немає графіка на цю дату")]
     schedule, url = found
-    png, caption = build_message(schedule, url)
+    png, caption = build_message(schedule, url, await month_for(storage, schedule))
     ok, failures = 0, []
     for chat_id, message_id, kind in await storage.latest_sent_per_chat(day.isoformat()):
         title = await storage.get_chat_title(chat_id) or str(chat_id)
@@ -379,6 +394,32 @@ class Watcher:
         for schedule, url in to_publish.values():
             await broadcast(self.bot, self.storage, schedule, url)
 
+    async def backfill(self, client: httpx.AsyncClient, until: date, max_pages: int = 12) -> int:
+        """Дозавантажити старіші пости каналу (сторінками «до»), поки не дійдемо до дати until.
+
+        Потрібно для статистики: щоб знати, що на початку місяця відключень справді не було,
+        а не що бот їх ще не бачив. Старі графіки лише зберігаються — не розсилаються.
+        """
+        before = await self.storage.oldest_post_id()
+        added = 0
+        for _ in range(max_pages):
+            if not before:
+                break
+            posts = await fetch_posts(client, self.channel, before=before)
+            if not posts:
+                break
+            for post in posts:
+                if await self.storage.get_post_hash(post.post_id) is None:
+                    schedule = _parse(post.text, post.posted_at)
+                    await self.storage.save_post(post.post_id, post.text, post.url, post.posted_at.isoformat(),
+                                                 schedule is not None)
+                    added += 1
+            before = min(p.post_id for p in posts)
+            if min(p.posted_at for p in posts).astimezone(KYIV).date() <= until:
+                break
+        log.info("Історія каналу: дозавантажено %d постів", added)
+        return added
+
     async def report_post_problems(self, post: Post, schedule: Optional[Schedule]) -> None:
         """Алерти власникам: рядки нового формату або графік-картинка, які бот не прочитає."""
         bad = unrecognized_lines(post.text)
@@ -428,8 +469,26 @@ class Watcher:
                 ttl=6 * 3600,
             )
 
+    async def ensure_history(self, client: httpx.AsyncClient) -> None:
+        """Один раз після оновлення: історія з 1-го числа попереднього місяця (для статистики)."""
+        if await self.storage.get_meta("history_backfilled"):
+            return
+        first_of_month = kyiv_now().date().replace(day=1)
+        until = (first_of_month - timedelta(days=1)).replace(day=1)
+        try:
+            added = await self.backfill(client, until)
+        except Exception:
+            log.exception("Не вдалося дозавантажити історію каналу — спробую наступного разу")
+            return
+        await self.storage.set_meta("history_backfilled", kyiv_now().isoformat(timespec="minutes"))
+        earliest = await self.storage.earliest_post_date()
+        if added:
+            await _alert("history", f"📚 Дозавантажив історію каналу: {added} постів, тепер дані з "
+                                    f"{datetime.fromisoformat(earliest).astimezone(KYIV):%d.%m.%Y}.", ttl=0)
+
     async def run(self) -> None:
         async with httpx.AsyncClient() as client:
+            await self.ensure_history(client)
             while True:
                 self.last_check = kyiv_now()
                 try:

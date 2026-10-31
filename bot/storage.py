@@ -503,6 +503,24 @@ class Storage:
         ) as cur:
             return list(await cur.fetchall())
 
+    async def earliest_post_date(self) -> Optional[str]:
+        """Найраніший відомий пост (будь-який) — з цієї дати бот «бачить» канал; ISO-рядок."""
+        async with self.db.execute("SELECT MIN(posted_at) FROM posts") as cur:
+            row = await cur.fetchone()
+        return row[0] if row and row[0] else None
+
+    async def oldest_post_id(self) -> Optional[int]:
+        async with self.db.execute("SELECT MIN(post_id) FROM posts") as cur:
+            row = await cur.fetchone()
+        return row[0] if row and row[0] else None
+
+    async def all_schedule_posts(self) -> List[Tuple[int, str, str, str]]:
+        """(post_id, text, url, posted_at) усіх постів з графіком — для статистики за місяць."""
+        async with self.db.execute(
+            "SELECT post_id, text, url, posted_at FROM posts WHERE is_schedule=1 ORDER BY post_id"
+        ) as cur:
+            return list(await cur.fetchall())
+
     async def recent_schedule_posts(self, limit: int = 10) -> List[Tuple[int, str, str, str]]:
         """(post_id, text, url, posted_at) останніх постів з графіком, від новіших до старіших."""
         async with self.db.execute(
