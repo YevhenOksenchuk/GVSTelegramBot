@@ -174,8 +174,13 @@ def format_summary(st: MonthStats) -> str:
     lines = [
         f"📊 <b>{st.title}</b> ({st.range_label})",
         f"У середньому <b>{_hours(st.avg_minutes)}</b> на чергу · {per_day} год/день",
-        f"Найбільше — {top_q} ({_hours(st.per_queue[top_q])}), найменше — {low_q} ({_hours(st.per_queue[low_q])})",
-        f"Днів з відключеннями: {st.days_with_outages} з {st.days_covered}",
+        "",
+        f"📈 Найбільше — {top_q} ({_hours(st.per_queue[top_q])})",
+        "",
+        f"📉 Найменше — {low_q} ({_hours(st.per_queue[low_q])})",
+        "",
+        f"📅 Днів з відключеннями: {st.days_with_outages} з {st.days_covered}",
+        "",
         "<i>Лише планові відключення за графіками ГПВ.</i>",
     ]
     return "\n".join(lines)
