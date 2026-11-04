@@ -52,12 +52,23 @@ def classify_gav(text: str) -> Optional[Tuple[str, Optional[str]]]:
     return None
 
 
-def format_gav(kind: str, time: Optional[str], url: str) -> str:
-    if kind == "start":
-        head = "🚨 <b>Аварійні відключення (ГАВ)" + (f" з {time}" if time else "") + "</b>"
-    else:
-        head = "✅ <b>Аварійні відключення (ГАВ) скасовано" + (f" з {time}" if time else "") + "</b>"
-    return f"{head}\n<a href=\"{escape(url)}\">Черкасиобленерго</a>"
+_GPV_NOTE = re.compile(r"[^.\n]*(?:продовжують\s+діяти|діють|діятимуть|не\s+діють)[^.\n]*\(ГПВ\)[^.\n]*\.", re.I)
+
+
+def gav_note(text: str) -> Optional[str]:
+    """Речення про ГПВ з поста обленерго (дослівно), напр. «Також продовжують діяти графіки … (ГПВ).»"""
+    m = _GPV_NOTE.search(text)
+    return m.group(0).strip() if m else None
+
+
+def format_gav(kind: str, time: Optional[str], url: str, note: Optional[str] = None) -> str:
+    when = f" з {time}" if time else ""
+    head = f"🚨 Аварійні відключення (ГАВ){when}" if kind == "start" else f"✅ Аварійні відключення (ГАВ) скасовано{when}"
+    parts = [head]
+    if note:
+        parts.append(escape(note))
+    parts.append(f'<a href="{escape(url)}">Черкасиобленерго</a>')
+    return "\n\n".join(parts)
 
 
 def is_announcement(text: str) -> bool:

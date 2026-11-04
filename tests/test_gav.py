@@ -3,7 +3,7 @@ import asyncio
 from datetime import datetime, timezone
 
 from bot import publisher
-from bot.announcements import classify_gav, format_gav, is_announcement
+from bot.announcements import classify_gav, format_gav, gav_note, is_announcement
 from bot.scraper import Post
 from bot.storage import Storage
 from tests.test_channel import FakeBot
@@ -26,8 +26,12 @@ def test_classify_and_format():
     assert classify_gav(STOP) == ("stop", "15:20")
     assert classify_gav(STOP2) == ("stop", "18:05")
     assert classify_gav(AD) is None and classify_gav(GENERIC) is None  # незрозуміле — не публікуємо наосліп
-    assert format_gav("start", "05:12", "u") == '🚨 <b>Аварійні відключення (ГАВ) з 05:12</b>\n<a href="u">Черкасиобленерго</a>'
-    assert format_gav("stop", None, "u").startswith("✅ <b>Аварійні відключення (ГАВ) скасовано</b>")
+    assert gav_note(START) == "Також продовжують діяти графіки погодинних відключень (ГПВ)." and gav_note(STOP) is None
+    assert format_gav("start", "05:12", "u", gav_note(START)) == (
+        "🚨 Аварійні відключення (ГАВ) з 05:12\n\n"
+        "Також продовжують діяти графіки погодинних відключень (ГПВ).\n\n"
+        '<a href="u">Черкасиобленерго</a>')
+    assert format_gav("stop", None, "u") == '✅ Аварійні відключення (ГАВ) скасовано\n\n<a href="u">Черкасиобленерго</a>'
     assert is_announcement(AD) is False or classify_gav(AD) is None  # реклама чат-ботів не має публікуватись сама
 
 
@@ -56,7 +60,7 @@ def test_watcher_publishes_gav_without_moderation(tmp_path, monkeypatch):
             await w.check_once(None)
             published = [(c, t, kw) for c, t, kw in bot.texts if "ГАВ" in t]
             assert [c for c, _, _ in published] == [-100]  # одразу в канал, без запиту власникам
-            assert published[0][1].startswith("🚨 <b>Аварійні відключення (ГАВ) з 05:12</b>")
+            assert published[0][1].startswith("🚨 Аварійні відключення (ГАВ) з 05:12\n\nТакож продовжують діяти")
             assert not [t for _, t, _ in bot.texts if "Оголошення обленерго" in t]
             assert await storage.announcement_status(2) == "published"
 
@@ -66,7 +70,7 @@ def test_watcher_publishes_gav_without_moderation(tmp_path, monkeypatch):
             clock["now"] = NOW.replace(hour=2, minute=30)  # уночі — без звуку
             feed.append(Post(3, STOP, datetime(2026, 10, 9, 23, 30, tzinfo=timezone.utc), "https://t.me/x/3"))
             await w.check_once(None)
-            assert bot.texts[-1][1].startswith("✅ <b>Аварійні відключення (ГАВ) скасовано з 15:20</b>")
+            assert bot.texts[-1][1].startswith("✅ Аварійні відключення (ГАВ) скасовано з 15:20")
             assert bot.texts[-1][2] and bot.texts[-1][2].get("disable_notification") is True
             assert published[0][2].get("disable_notification") is False
         finally:

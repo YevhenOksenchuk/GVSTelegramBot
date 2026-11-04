@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover
     from backports.zoneinfo import ZoneInfo  # type: ignore
 
 from .alerts import Alerts
-from .announcements import classify_gav, format_announcement, format_gav, is_announcement
+from .announcements import classify_gav, format_announcement, format_gav, gav_note, is_announcement
 from .formatter import format_caption
 from .parser import Schedule, parse_post, unrecognized_lines
 from .render import render_schedule
@@ -365,7 +365,7 @@ async def publish_gav(bot: Bot, storage: Storage, post: Post, kind: str, time: O
     if await storage.announcement_status(post.post_id) is not None:
         return 0
     await storage.set_announcement(post.post_id, "published")
-    return await broadcast_text(bot, storage, format_gav(kind, time, post.url), post.post_id,
+    return await broadcast_text(bot, storage, format_gav(kind, time, post.url, gav_note(post.text)), post.post_id,
                                 silent=is_quiet(kyiv_now()))
 
 
