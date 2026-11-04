@@ -15,7 +15,7 @@ from typing import Dict, FrozenSet, List, Optional, Tuple
 from aiogram import Bot
 
 from .parser import QUEUES
-from .publisher import KYIV, kyiv_now, latest_by_day
+from .publisher import KYIV, QUIET_HOURS, is_quiet, kyiv_now, latest_by_day  # noqa: F401 (is_quiet — спільна)
 from .storage import Storage
 
 log = logging.getLogger(__name__)
@@ -134,11 +134,6 @@ async def run_once(bot: Bot, storage: Storage, owner_ids: FrozenSet[int], now: O
 
 QueueEnd = Tuple[str, datetime]  # (підчерга, кінець відключення)
 _USERNAME_CHECKED: set = set()   # чати, для яких уже пробували дізнатися @username
-QUIET_HOURS = (0, 5)             # «комендантська година»: нагадування в чати без звуку з 00:00 до 05:00
-
-
-def is_quiet(now: datetime) -> bool:
-    return QUIET_HOURS[0] <= now.hour < QUIET_HOURS[1]
 
 
 def chat_due_groups(by_day: Dict[date, object], days, now: datetime, lead_minutes: int

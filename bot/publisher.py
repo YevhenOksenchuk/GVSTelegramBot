@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover
     from backports.zoneinfo import ZoneInfo  # type: ignore
 
 from .alerts import Alerts
-from .announcements import format_announcement, is_announcement
+from .announcements import classify_gav, format_announcement, format_gav, is_announcement
 from .formatter import format_caption
 from .parser import Schedule, parse_post, unrecognized_lines
 from .render import render_schedule
@@ -50,6 +50,13 @@ def _looks_like_schedule(text: str) -> bool:
 
 def kyiv_now() -> datetime:
     return datetime.now(KYIV)
+
+
+QUIET_HOURS = (0, 5)  # «комендантська година»: повідомлення в чати без звуку з 00:00 до 05:00
+
+
+def is_quiet(now: datetime) -> bool:
+    return QUIET_HOURS[0] <= now.hour < QUIET_HOURS[1]
 
 
 def build_message(schedule: Schedule, url: str, month: Optional[MonthStats] = None) -> Tuple[Optional[bytes], str]:
@@ -160,16 +167,17 @@ async def deactivate_with_alert(storage: Storage, chat_id: int, reason: str) -> 
 
 async def send_schedule(
     bot: Bot, storage: Storage, chat_id: int, png: Optional[bytes], caption: str,
-    post_id: Optional[int] = None, day: Optional[date] = None,
+    post_id: Optional[int] = None, day: Optional[date] = None, silent: bool = False,
 ) -> Optional[int]:
     """Надіслати графік (фото з підписом або лише текст). Повертає message_id, якщо вдалося.
 
-    post_id/day — щоб запам'ятати повідомлення для закріплення та /fix.
+    post_id/day — щоб запам'ятати повідомлення для закріплення та /fix; silent — без звуку.
     """
     for _ in range(3):
         try:
             if png is None:
-                msg = await bot.send_message(chat_id, caption, parse_mode="HTML", disable_web_page_preview=True)
+                msg = await bot.send_message(chat_id, caption, parse_mode="HTML", disable_web_page_preview=True,
+                                             disable_notification=silent)
             else:
                 msg = await bot.send_photo(
                     chat_id,
@@ -332,20 +340,33 @@ async def propose_announcement(bot: Bot, storage: Storage, owner_ids: FrozenSet[
             log.warning("Не вдалося надіслати оголошення власнику %s: %s", owner, e)
 
 
+async def broadcast_text(bot: Bot, storage: Storage, body: str, post_id: int, silent: bool = False) -> int:
+    """Надіслати текст в усі активні чати. Повертає кількість чатів."""
+    sent = 0
+    for chat_id, _ in await storage.active_chats_typed():
+        if await send_schedule(bot, storage, chat_id, None, body, post_id, None, silent=silent):
+            sent += 1
+        await asyncio.sleep(0.05)
+    log.info("Повідомлення за постом %s розіслано в %d чатів", post_id, sent)
+    return sent
+
+
 async def publish_announcement(bot: Bot, storage: Storage, post_id: int) -> int:
-    """Опублікувати оголошення текстом в усі активні чати. Повертає кількість чатів."""
+    """Опублікувати оголошення (після кнопки власника) текстом в усі активні чати."""
     row = await storage.get_post(post_id)
     if not row:
         return 0
     text, url, _ = row
-    body = format_announcement(text, url)
-    sent = 0
-    for chat_id, _ in await storage.active_chats_typed():
-        if await send_schedule(bot, storage, chat_id, None, body, post_id, None):
-            sent += 1
-        await asyncio.sleep(0.05)
-    log.info("Оголошення %s розіслано в %d чатів", post_id, sent)
-    return sent
+    return await broadcast_text(bot, storage, format_announcement(text, url), post_id)
+
+
+async def publish_gav(bot: Bot, storage: Storage, post: Post, kind: str, time: Optional[str]) -> int:
+    """ГАВ публікуємо одразу й коротко, без модерації; уночі — без звуку."""
+    if await storage.announcement_status(post.post_id) is not None:
+        return 0
+    await storage.set_announcement(post.post_id, "published")
+    return await broadcast_text(bot, storage, format_gav(kind, time, post.url), post.post_id,
+                                silent=is_quiet(kyiv_now()))
 
 
 class Watcher:
@@ -377,8 +398,12 @@ class Watcher:
                 continue
             await self.report_post_problems(post, schedule)
             if schedule is None:
-                if old_hash is None and is_announcement(post.text):  # новий пост без графіка — на модерацію
-                    await propose_announcement(self.bot, self.storage, self.owner_ids, post)
+                if old_hash is None:  # новий пост без графіка
+                    gav = classify_gav(post.text)
+                    if gav:  # аварійні відключення — одразу й коротко
+                        await publish_gav(self.bot, self.storage, post, *gav)
+                    elif is_announcement(post.text):  # решта важливого — на модерацію власникам
+                        await propose_announcement(self.bot, self.storage, self.owner_ids, post)
                 continue
             if schedule.day and schedule.day < kyiv_now().date():
                 continue  # старий графік — не спамимо

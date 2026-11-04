@@ -234,11 +234,11 @@ def test_text_fallback_when_render_fails(monkeypatch):
     sent = []
 
     class Bot:
-        async def send_message(self, chat_id, text, parse_mode, disable_web_page_preview):
+        async def send_message(self, chat_id, text, **kw):
             sent.append(("text", chat_id, text))
             return SimpleNamespace(message_id=1)
 
-    def boom(schedule):
+    def boom(schedule, month=None):
         raise ValueError("render failed")
 
     from bot.parser import parse_post

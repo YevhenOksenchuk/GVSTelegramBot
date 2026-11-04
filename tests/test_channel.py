@@ -45,7 +45,7 @@ class FakeBot:
         return self._msg(chat_id)
 
     async def send_message(self, chat_id, text, **kw):
-        self.texts.append((chat_id, text, kw.get("reply_markup")))
+        self.texts.append((chat_id, text, kw))
         return self._msg(chat_id)
 
     async def pin_chat_message(self, chat_id, message_id, disable_notification=False):
