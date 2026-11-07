@@ -98,6 +98,18 @@ class FakeCallback:
             self.alerts.append(text)
 
 
+def test_post_all_button(tmp_path, monkeypatch):
+    async def scenario(storage, bot):
+        await storage.add_chat(-100, "Зоя Вовк", "channel", 1)
+        await storage.add_chat(1, "Власник", "private", 1)
+        cb = FakeCallback(1, "post:all")
+        await handlers.on_post_button(cb, storage, bot, OWNERS)
+        assert sorted(c for c, _ in bot.photos) == [-100, -100, 1, 1]  # сьогодні + завтра в кожен чат
+        assert cb.edited == "✅ Опубліковано в 2 чатів"
+
+    run(tmp_path, monkeypatch, scenario)
+
+
 def test_post_button(tmp_path, monkeypatch):
     async def scenario(storage, bot):
         await storage.add_chat(-100, "Зоя Вовк", "channel", 1)

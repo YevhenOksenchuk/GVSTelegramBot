@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover
 
 from .alerts import Alerts
 from .announcements import classify_gav, format_announcement, format_gav, gav_note, is_announcement, is_special
-from .formatter import format_caption
+from .formatter import CAPTION_LIMIT, TEXT_LIMIT, format_caption, hard_trim
 from .parser import Schedule, parse_post, unrecognized_lines
 from .render import render_schedule
 from .scraper import Post, fetch_posts
@@ -173,6 +173,7 @@ async def send_schedule(
 
     post_id/day — щоб запам'ятати повідомлення для закріплення та /fix; silent — без звуку.
     """
+    trimmed = False
     for _ in range(3):
         try:
             if png is None:
@@ -202,7 +203,15 @@ async def send_schedule(
             await deactivate_with_alert(storage, chat_id, str(e))
             return None
         except TelegramBadRequest as e:
-            if "chat not found" in str(e).lower() or "not enough rights" in str(e).lower():
+            reason = str(e).lower()
+            if "too long" in reason and not trimmed:  # страхування: підпис задовгий — обрізаємо й пробуємо ще раз
+                limit = CAPTION_LIMIT if png is not None else TEXT_LIMIT
+                caption, trimmed = hard_trim(caption, limit), True
+                log.warning("Підпис для %s задовгий — обрізано до %d", chat_id, limit)
+                await _alert("caption_trimmed", "⚠️ Підпис до графіка не вліз у ліміт Telegram — обрізав. "
+                                                "Варто подивитися, чи все читається.", ttl=86400)
+                continue
+            if "chat not found" in reason or "not enough rights" in reason:
                 log.info("Чат %s недоступний (%s) — деактивую", chat_id, e)
                 await deactivate_with_alert(storage, chat_id, str(e))
             else:

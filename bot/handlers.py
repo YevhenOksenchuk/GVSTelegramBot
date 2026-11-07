@@ -179,7 +179,8 @@ async def cmd_post(message: Message, storage: Storage, owner_ids: FrozenSet[int]
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"{_KIND.get(type_, '')} {title}"[:60], callback_data=f"post:{chat_id}")]
         for chat_id, title, type_ in chats
-    ] + [[InlineKeyboardButton(text="Скасувати", callback_data="post:cancel")]])
+    ] + [[InlineKeyboardButton(text="📣 В усі чати", callback_data="post:all")],
+         [InlineKeyboardButton(text="Скасувати", callback_data="post:cancel")]])
     await message.answer("Куди опублікувати актуальний графік?", reply_markup=keyboard)
 
 
@@ -192,6 +193,14 @@ async def on_post_button(cb: CallbackQuery, storage: Storage, bot: Bot, owner_id
     if target == "cancel":
         await cb.message.edit_text("Скасовано.")
         await cb.answer()
+        return
+    if target == "all":  # актуальний графік в усі активні чати (канали, групи, особисті)
+        await cb.answer("Публікую…")
+        done = 0
+        for chat_id, _ in await storage.active_chats_typed():
+            if await publish_current(bot, storage, chat_id, pin=True):
+                done += 1
+        await cb.message.edit_text(f"✅ Опубліковано в {done} чатів")
         return
     chat_id = int(target)
     title = escape(await storage.get_chat_title(chat_id) or str(chat_id))
