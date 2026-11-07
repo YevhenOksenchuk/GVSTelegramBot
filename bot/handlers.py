@@ -15,7 +15,7 @@ from .access import is_allowed, request_access, welcome_text
 from .config import Config
 from .maintenance import LAST_BACKUP_AT, send_backup
 from .parser import date_label
-from .publisher import Watcher, fix_messages, kyiv_now, publish_announcement, publish_current
+from .publisher import Watcher, delete_published, fix_messages, kyiv_now, publish_announcement, publish_current
 from .reminders import LEAD_OPTIONS
 from .storage import Storage
 
@@ -396,6 +396,34 @@ async def on_announcement_button(cb: CallbackQuery, storage: Storage, bot: Bot, 
     if not edited:
         try:
             await cb.message.edit_text(result, parse_mode="HTML", disable_web_page_preview=True)
+        except Exception:
+            pass
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("del:"))
+async def on_deleted_button(cb: CallbackQuery, storage: Storage, bot: Bot, owner_ids: FrozenSet[int]) -> None:
+    """Обленерго видалило пост: власник вирішує, чи прибрати повідомлення бота в усіх чатах."""
+    if cb.from_user.id not in owner_ids:
+        await cb.answer("Лише для власника бота", show_alert=True)
+        return
+    _, action, raw_id = cb.data.split(":")
+    post_id = int(raw_id)
+    prompts = await storage.pop_prompts("deleted", post_id)
+    if not prompts:
+        await cb.answer("Уже вирішено", show_alert=True)
+        return
+    if action == "yes":
+        await cb.answer("Прибираю…")
+        ok, failed = await delete_published(bot, storage, post_id)
+        result = f"🗑 Прибрано повідомлень: {ok}" + (f", не вдалося: {failed}" if failed else "")
+    else:
+        result = "Залишено як є"
+    if len(owner_ids) > 1:
+        result += f"\n<i>вирішив(ла): {escape(cb.from_user.full_name or str(cb.from_user.id))}</i>"
+    for chat_id, message_id in prompts:
+        try:
+            await bot.edit_message_text(result, chat_id=chat_id, message_id=message_id, parse_mode="HTML")
         except Exception:
             pass
     await cb.answer()

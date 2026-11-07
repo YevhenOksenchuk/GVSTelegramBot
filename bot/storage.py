@@ -94,6 +94,9 @@ _CHAT_COLUMNS = (
     ("username", "TEXT"),                           # публічний @username чату — для посилань на графік
     ("remind_lead", "INTEGER NOT NULL DEFAULT 0"),  # нагадування в чат за N хв до відключення; 0 = вимкнено
 )
+_POST_COLUMNS = (
+    ("deleted_at", "TEXT"),  # обленерго видалило пост — такий графік більше не чинний
+)
 
 
 def text_hash(text: str) -> str:
@@ -113,11 +116,12 @@ class Storage:
         await self.db.commit()
 
     async def _migrate(self) -> None:
-        async with self.db.execute("PRAGMA table_info(chats)") as cur:
-            existing = {row[1] for row in await cur.fetchall()}
-        for name, ddl in _CHAT_COLUMNS:
-            if name not in existing:
-                await self.db.execute(f"ALTER TABLE chats ADD COLUMN {name} {ddl}")
+        for table, columns in (("chats", _CHAT_COLUMNS), ("posts", _POST_COLUMNS)):
+            async with self.db.execute(f"PRAGMA table_info({table})") as cur:
+                existing = {row[1] for row in await cur.fetchall()}
+            for name, ddl in columns:
+                if name not in existing:
+                    await self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     async def close(self) -> None:
         if self.db:
@@ -489,7 +493,7 @@ class Storage:
     async def schedule_posts_before(self, post_id: int, limit: int = 30) -> List[Tuple[str, str]]:
         """(text, posted_at) попередніх постів з графіком, від новіших до старіших."""
         async with self.db.execute(
-            "SELECT text, posted_at FROM posts WHERE is_schedule=1 AND post_id<? "
+            "SELECT text, posted_at FROM posts WHERE is_schedule=1 AND deleted_at IS NULL AND post_id<? "
             "ORDER BY post_id DESC LIMIT ?",
             (post_id, limit),
         ) as cur:
@@ -498,10 +502,28 @@ class Storage:
     async def schedule_posts_after(self, post_id: int) -> List[Tuple[str, str]]:
         """(text, posted_at) новіших постів з графіком."""
         async with self.db.execute(
-            "SELECT text, posted_at FROM posts WHERE is_schedule=1 AND post_id>? ORDER BY post_id",
+            "SELECT text, posted_at FROM posts WHERE is_schedule=1 AND deleted_at IS NULL AND post_id>? "
+            "ORDER BY post_id",
             (post_id,),
         ) as cur:
             return list(await cur.fetchall())
+
+    # --- видалені обленерго пости ---
+    async def post_ids_between(self, lo: int, hi: int) -> List[int]:
+        """Збережені (не видалені) пости з id у діапазоні — щоб помітити зниклі зі сторінки каналу."""
+        async with self.db.execute(
+            "SELECT post_id FROM posts WHERE post_id BETWEEN ? AND ? AND deleted_at IS NULL ORDER BY post_id",
+            (lo, hi),
+        ) as cur:
+            return [r[0] for r in await cur.fetchall()]
+
+    async def mark_deleted(self, post_id: int) -> None:
+        await self.db.execute("UPDATE posts SET deleted_at=CURRENT_TIMESTAMP WHERE post_id=?", (post_id,))
+        await self.db.commit()
+
+    async def forget_sent(self, post_id: int) -> None:
+        await self.db.execute("DELETE FROM sent_messages WHERE post_id=?", (post_id,))
+        await self.db.commit()
 
     async def earliest_post_date(self) -> Optional[str]:
         """Найраніший відомий пост (будь-який) — з цієї дати бот «бачить» канал; ISO-рядок."""
@@ -517,14 +539,15 @@ class Storage:
     async def all_schedule_posts(self) -> List[Tuple[int, str, str, str]]:
         """(post_id, text, url, posted_at) усіх постів з графіком — для статистики за місяць."""
         async with self.db.execute(
-            "SELECT post_id, text, url, posted_at FROM posts WHERE is_schedule=1 ORDER BY post_id"
+            "SELECT post_id, text, url, posted_at FROM posts WHERE is_schedule=1 AND deleted_at IS NULL "
+            "ORDER BY post_id"
         ) as cur:
             return list(await cur.fetchall())
 
     async def recent_schedule_posts(self, limit: int = 10) -> List[Tuple[int, str, str, str]]:
         """(post_id, text, url, posted_at) останніх постів з графіком, від новіших до старіших."""
         async with self.db.execute(
-            "SELECT post_id, text, url, posted_at FROM posts WHERE is_schedule=1 "
+            "SELECT post_id, text, url, posted_at FROM posts WHERE is_schedule=1 AND deleted_at IS NULL "
             "ORDER BY post_id DESC LIMIT ?",
             (limit,),
         ) as cur:

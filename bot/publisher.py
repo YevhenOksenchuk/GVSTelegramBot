@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover
     from backports.zoneinfo import ZoneInfo  # type: ignore
 
 from .alerts import Alerts
-from .announcements import classify_gav, format_announcement, format_gav, gav_note, is_announcement
+from .announcements import classify_gav, format_announcement, format_gav, gav_note, is_announcement, is_special
 from .formatter import format_caption
 from .parser import Schedule, parse_post, unrecognized_lines
 from .render import render_schedule
@@ -365,8 +365,47 @@ async def publish_gav(bot: Bot, storage: Storage, post: Post, kind: str, time: O
     if await storage.announcement_status(post.post_id) is not None:
         return 0
     await storage.set_announcement(post.post_id, "published")
-    return await broadcast_text(bot, storage, format_gav(kind, time, post.url, gav_note(post.text)), post.post_id,
-                                silent=is_quiet(kyiv_now()))
+    body = format_gav(kind, time, post.url, gav_note(post.text), special_stop=is_special(post.text))
+    return await broadcast_text(bot, storage, body, post.post_id, silent=is_quiet(kyiv_now()))
+
+
+async def on_post_deleted(bot: Bot, storage: Storage, owner_ids: FrozenSet[int], post_id: int) -> None:
+    """Обленерго видалило пост. Якщо бот з нього щось публікував — питаємо власників, чи прибрати."""
+    await storage.mark_deleted(post_id)
+    sent = await storage.sent_for_post(post_id)
+    row = await storage.get_post(post_id)
+    log.warning("Пост %s видалено з каналу; наших повідомлень з нього: %d", post_id, len(sent))
+    if not sent or not row or not owner_ids:
+        return
+    text, url, _ = row
+    quote = text[:300] + ("…" if len(text) > 300 else "")
+    body = (f"⚠️ Обленерго <b>видалило</b> свій пост, з якого я опублікував {len(sent)} повідомл.:\n"
+            f"<i>{escape(quote)}</i>\n{url}\n\nПрибрати їх в усіх чатах?")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🗑 Прибрати в усіх чатах", callback_data=f"del:yes:{post_id}"),
+        InlineKeyboardButton(text="Залишити", callback_data=f"del:no:{post_id}"),
+    ]])
+    for owner in owner_ids:
+        try:
+            msg = await bot.send_message(owner, body, parse_mode="HTML", reply_markup=keyboard,
+                                         disable_web_page_preview=True)
+            await storage.save_prompt("deleted", post_id, owner, msg.message_id)
+        except Exception as e:
+            log.warning("Не вдалося написати власнику %s про видалений пост: %s", owner, e)
+
+
+async def delete_published(bot: Bot, storage: Storage, post_id: int) -> Tuple[int, int]:
+    """Видалити всі повідомлення бота, зроблені з поста. Повертає (видалено, не вдалося)."""
+    ok = failed = 0
+    for chat_id, message_id, _ in await storage.sent_for_post(post_id):
+        try:
+            await bot.delete_message(chat_id, message_id)
+            ok += 1
+        except Exception as e:
+            log.info("Не вдалося видалити %s/%s: %s", chat_id, message_id, e)
+            failed += 1
+    await storage.forget_sent(post_id)
+    return ok, failed
 
 
 class Watcher:
@@ -380,10 +419,22 @@ class Watcher:
         self.last_error: Optional[str] = None
         self.failing_since: Optional[datetime] = None
 
+    async def detect_deleted(self, posts: List[Post]) -> None:
+        """Збережений пост зник зі сторінки каналу, хоча сусідні є, — обленерго його видалило."""
+        if not posts:
+            return
+        present = {p.post_id for p in posts}
+        for post_id in await self.storage.post_ids_between(posts[0].post_id, posts[-1].post_id):
+            if post_id not in present:
+                await on_post_deleted(self.bot, self.storage, self.owner_ids, post_id)
+
     async def check_once(self, client: httpx.AsyncClient) -> None:
         first_run = not await self.storage.has_any_posts()
         to_publish = {}  # дата -> (графік, посилання): по одному, найсвіжішому, на кожну дату
-        for post in await fetch_posts(client, self.channel):
+        posts = await fetch_posts(client, self.channel)
+        if not first_run:
+            await self.detect_deleted(posts)
+        for post in posts:
             old_hash = await self.storage.get_post_hash(post.post_id)
             if old_hash == text_hash(post.text):
                 continue

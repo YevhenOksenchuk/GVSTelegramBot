@@ -3,7 +3,7 @@ import asyncio
 from datetime import datetime, timezone
 
 from bot import publisher
-from bot.announcements import classify_gav, format_gav, gav_note, is_announcement
+from bot.announcements import classify_gav, format_gav, gav_note, is_announcement, is_special
 from bot.scraper import Post
 from bot.storage import Storage
 from tests.test_channel import FakeBot
@@ -18,6 +18,22 @@ STOP = "З 15:20 по Черкаській області скасовано г�
 STOP2 = "ГАВ припинено о 18:05, діють лише ГПВ."
 AD = "У чат-ботах можна дізнатися свою чергу, розділ «Відключення» — «Черги ГПВ/ГАВ»."
 GENERIC = "У низці регіонів України, зокрема у Києві, вимушено застосовуються аварійні відключення електроенергії."
+
+
+SPECIAL = ('7 листопада з 06:44 по Черкаській області скасовано графіки аварійних відключень (ГАВ) та '
+           'застосовані спеціальні графіки аварійних відключень (СГАВ) за командою НЕК "Укренерго".')
+SPECIAL_ONLY = "7 листопада з 06:44 по Черкаській області застосовані спеціальні графіки аварійних відключень (СГАВ)."
+SPECIAL_STOP = "З 18:05 скасовано спеціальні графіки аварійних відключень (СГАВ)."
+
+
+def test_special_schedules_take_precedence_over_cancellation():
+    assert classify_gav(SPECIAL) == ("special", "06:44")  # «застосовано» важливіше за «скасовано» в тому ж пості
+    assert classify_gav(SPECIAL_ONLY) == ("special", "06:44")
+    assert classify_gav(SPECIAL_STOP) == ("stop", "18:05") and is_special(SPECIAL_STOP)
+    assert format_gav("special", "06:44", "u") == (
+        "🚨 Спеціальні графіки аварійних відключень (СГАВ) з 06:44\n\n<a href=\"u\">Черкасиобленерго</a>")
+    assert format_gav("stop", "18:05", "u", special_stop=True).startswith(
+        "✅ Спеціальні графіки аварійних відключень (СГАВ) скасовано з 18:05")
 
 
 def test_classify_and_format():

@@ -32,7 +32,7 @@ LOCAL_EMERGENCY = "Через аварійну ситуацію на підст�
 
 class FakeBot:
     def __init__(self, pin_fails=(), edit_fails=()):
-        self.photos, self.texts, self.pins, self.unpins, self.edits = [], [], [], [], []
+        self.photos, self.texts, self.pins, self.unpins, self.edits, self.deleted = [], [], [], [], [], []
         self.pin_fails, self.edit_fails = set(pin_fails), set(edit_fails)
         self._n = 0
 
@@ -67,6 +67,9 @@ class FakeBot:
 
     async def edit_message_text(self, text, chat_id, message_id, **kw):
         self.edits.append(("text", chat_id, message_id, text))
+
+    async def delete_message(self, chat_id, message_id):
+        self.deleted.append((chat_id, message_id))
 
 
 class FakeAlerts:
