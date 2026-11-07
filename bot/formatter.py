@@ -57,17 +57,18 @@ def format_caption(schedule: Schedule, source_url: str, my_queue: Optional[str] 
     """Підпис до картинки. my_queue — підчерга читача (в особистих): додає персональний рядок угорі.
 
     Telegram обмежує підпис 1024 символами, тому варіанти від повного до найкомпактнішого:
-    з деталями «було:» → без деталей → години без «:00» → без підказки → без порожніх рядків → обрізання.
+    з деталями «було:» → без деталей → без підказки → без порожніх рядків → без рядка «Ваша черга»
+    → години без «:00» (крайній засіб) → обрізання.
     """
     head = "🔄 <b>Оновлений графік ГПВ</b>" if schedule.updated else "⚡ <b>Графік відключень (ГПВ)</b>"
     if schedule.date_label:
         head += f" — <b>{escape(schedule.date_label)}</b>"
 
-    def build(details: bool, compact: bool, hint: bool, gaps: bool) -> str:
+    def build(details: bool, compact: bool, hint: bool, gaps: bool, personal: bool = True) -> str:
         lines = [head]
         if schedule.updated and schedule.time_label:
             lines.append(f"🕐 оновлено о {schedule.time_label}")
-        if my_queue:
+        if my_queue and personal:
             mark = "  ✏️" if my_queue in schedule.changed else ""
             lines += ["", f"💡 <b>Ваша {my_queue}:</b> {_intervals(schedule.queues.get(my_queue, []), compact)}{mark}"]
         lines.append("")
@@ -89,12 +90,16 @@ def format_caption(schedule: Schedule, source_url: str, my_queue: Optional[str] 
         lines.append(f'<a href="{escape(source_url)}">Джерело: Черкасиобленерго</a>')
         return "\n".join(lines)
 
-    attempts = (
-        (True, False, True, True),
-        (False, False, True, True),
-        (False, True, True, True),
-        (False, True, False, True),
-        (False, True, False, False),
+    attempts = (  # (деталі, компактний час, підказка, порожні рядки, «Ваша черга»)
+        (True, False, True, True, True),
+        (False, False, True, True, True),
+        (False, False, False, True, True),
+        (False, False, False, False, True),
+        (False, False, False, True, False),
+        (False, False, False, False, False),
+        (False, True, True, True, True),
+        (False, True, False, True, True),
+        (False, True, False, False, False),
     )
     text = ""
     for attempt in attempts:
