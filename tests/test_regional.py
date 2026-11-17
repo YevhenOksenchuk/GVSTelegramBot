@@ -65,3 +65,33 @@ def test_watcher_publishes_regional_separately(tmp_path, monkeypatch):
             await storage.close()
 
     asyncio.run(scenario())
+
+
+def test_fix_converts_wrongly_published_regional_post(tmp_path, monkeypatch):
+    """Як 17 листопада: уманський графік пішов як обласний і закріпився; /fix робить з нього індивідуальний."""
+    monkeypatch.setattr(publisher, "kyiv_now", lambda: datetime(2026, 11, 17, 12, 0, tzinfo=publisher.KYIV))
+
+    async def scenario():
+        storage = Storage(str(tmp_path / "t.db"))
+        await storage.open()
+        try:
+            await storage.add_chat(-100, "Канал", "channel", 1)
+            await storage.save_post(2027, "Графік ГПВ на 17 листопада.\n" + BODY, "u2027",
+                                    datetime(2026, 11, 16, 23, 45, tzinfo=publisher.KYIV).isoformat(), True)
+            await storage.save_post(2028, TEXT, "u2028",
+                                    datetime(2026, 11, 17, 9, 8, tzinfo=publisher.KYIV).isoformat(), True)
+            await storage.record_sent(-100, 10, 2027, "2026-11-17", "photo")  # правильний обласний
+            await storage.record_sent(-100, 11, 2028, "2026-11-17", "photo")  # помилково як «оновлення»
+            await storage.set_pinned(-100, 11)
+            bot = FakeBot()
+            ok, failures = await publisher.fix_messages(bot, storage, date(2026, 11, 17))
+            assert failures == [] and ok == 2
+            by_msg = {m: cap for _, _, m, cap in bot.edits}
+            assert "Індивідуальний графік — Частина Уманського району" in by_msg[11]
+            assert "Графік відключень (ГПВ)" in by_msg[10] and "Індивідуальний" not in by_msg[10]
+            assert bot.pins == [(-100, 10)] and bot.unpins == [(-100, 11)]
+            assert await storage.latest_sent_per_chat("2026-11-17") == [(-100, 10, "photo")]
+        finally:
+            await storage.close()
+
+    asyncio.run(scenario())

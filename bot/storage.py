@@ -212,6 +212,19 @@ class Storage:
         ) as cur:
             return [(r[0], r[1], r[2]) for r in await cur.fetchall()]
 
+    async def sent_post_id(self, chat_id: int, message_id: int) -> Optional[int]:
+        async with self.db.execute(
+            "SELECT post_id FROM sent_messages WHERE chat_id=? AND message_id=? ORDER BY id DESC LIMIT 1",
+            (chat_id, message_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else None
+
+    async def clear_sent_day(self, chat_id: int, message_id: int) -> None:
+        await self.db.execute("UPDATE sent_messages SET day=NULL WHERE chat_id=? AND message_id=?",
+                              (chat_id, message_id))
+        await self.db.commit()
+
     async def sent_for_post(self, post_id: int) -> List[Tuple[int, int, str]]:
         async with self.db.execute(
             "SELECT chat_id, message_id, kind FROM sent_messages WHERE post_id=? ORDER BY id", (post_id,)

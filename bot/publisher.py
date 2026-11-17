@@ -295,39 +295,70 @@ async def broadcast(bot: Bot, storage: Storage, schedule: Schedule, url: str) ->
     return sent
 
 
+async def _edit_published(bot: Bot, chat_id: int, message_id: int, kind: str,
+                          png: Optional[bytes], caption: str) -> None:
+    if kind == "photo" and png is not None:
+        media = InputMediaPhoto(media=BufferedInputFile(png, filename="grafik.png"),
+                                caption=caption, parse_mode="HTML")
+        await bot.edit_message_media(media, chat_id=chat_id, message_id=message_id)
+    elif kind == "photo":
+        await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=caption, parse_mode="HTML")
+    else:
+        await bot.edit_message_text(caption, chat_id=chat_id, message_id=message_id, parse_mode="HTML",
+                                    disable_web_page_preview=True)
+
+
 async def fix_messages(bot: Bot, storage: Storage, day: date) -> Tuple[int, List[Tuple[str, str]]]:
     """Замінити картинку й текст у вже надісланих повідомленнях за дату на актуальну версію графіка.
 
+    Якщо повідомлення зроблено з індивідуального графіка району (помилково опублікованого як обласний),
+    воно стає постом «Індивідуальний графік», а закріплення повертається на попередній обласний графік.
     Повертає (скільки оновлено, [(назва чату, помилка), ...]).
     """
+    ok, failures = 0, []
+
+    async def attempt(chat_id: int, message_id: int, kind: str, png: Optional[bytes], caption: str) -> bool:
+        nonlocal ok
+        try:
+            await _edit_published(bot, chat_id, message_id, kind, png, caption)
+        except TelegramBadRequest as e:
+            if "not modified" not in str(e).lower():  # «not modified» — уже актуальне
+                failures.append((await storage.get_chat_title(chat_id) or str(chat_id), str(e)))
+                return False
+        except Exception as e:
+            failures.append((await storage.get_chat_title(chat_id) or str(chat_id), str(e)))
+            return False
+        ok += 1
+        await asyncio.sleep(0.05)
+        return True
+
+    # 1) Повідомлення з індивідуального графіка району → формат «Індивідуальний графік»
+    for chat_id, message_id, kind in await storage.latest_sent_per_chat(day.isoformat()):
+        post_id = await storage.sent_post_id(chat_id, message_id)
+        row = await storage.get_post(post_id) if post_id else None
+        regional = parse_regional(row[0], datetime.fromisoformat(row[2]).astimezone(KYIV).date()) if row else None
+        if not regional:
+            continue
+        try:
+            png: Optional[bytes] = render_schedule(regional)
+        except Exception:
+            png = None
+        if not await attempt(chat_id, message_id, kind, png, format_regional_caption(regional, row[1])):
+            continue
+        await storage.clear_sent_day(chat_id, message_id)  # більше не «графік на цю дату»
+        pinned, _, _ = await storage.pin_state(chat_id)
+        previous = await storage.latest_sent_message(chat_id, day.isoformat())
+        if pinned == message_id and previous and previous != message_id:  # закріплення — назад на обласний
+            await maybe_pin(bot, storage, chat_id, await storage.get_chat_type(chat_id) or "private", previous)
+
+    # 2) Обласний графік на цю дату → актуальна версія
     found = await latest_schedule_for_day(storage, day)
     if not found:
-        return 0, [("—", "немає графіка на цю дату")]
+        return ok, failures or [("—", "немає графіка на цю дату")]
     schedule, url = found
     png, caption = build_message(schedule, url, await month_for(storage, schedule))
-    ok, failures = 0, []
     for chat_id, message_id, kind in await storage.latest_sent_per_chat(day.isoformat()):
-        title = await storage.get_chat_title(chat_id) or str(chat_id)
-        try:
-            if kind == "photo" and png is not None:
-                media = InputMediaPhoto(media=BufferedInputFile(png, filename="grafik.png"),
-                                        caption=caption, parse_mode="HTML")
-                await bot.edit_message_media(media, chat_id=chat_id, message_id=message_id)
-            elif kind == "photo":
-                await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=caption,
-                                               parse_mode="HTML")
-            else:
-                await bot.edit_message_text(caption, chat_id=chat_id, message_id=message_id, parse_mode="HTML",
-                                            disable_web_page_preview=True)
-            ok += 1
-        except TelegramBadRequest as e:
-            if "not modified" in str(e).lower():
-                ok += 1  # уже актуальне
-            else:
-                failures.append((title, str(e)))
-        except Exception as e:
-            failures.append((title, str(e)))
-        await asyncio.sleep(0.05)
+        await attempt(chat_id, message_id, kind, png, caption)
     return ok, failures
 
 
