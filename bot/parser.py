@@ -155,6 +155,17 @@ def parse_date(text: str, fallback: Optional[date] = None) -> Optional[date]:
         return fallback
 
 
+# Графік не для всієї області, а для окремого району/філій (напр. «тимчасові індивідуальні графіки» Уманщини)
+_REGIONAL = re.compile(
+    r"індивідуальн\w*\s+графік|в\s+частині\s+\S+\s+району|діють\s+для\s+споживачів|для\s+споживачів\s+ВСП",
+    re.I,
+)
+
+
+def is_regional(text: str) -> bool:
+    return bool(_REGIONAL.search(text))
+
+
 def unrecognized_lines(text: str) -> List[str]:
     """Рядки з часом, які не вдалося прив'язати до підчерги, — ознака нового формату посту."""
     matched = {m.group(0).strip() for m in _QUEUE_LINE.finditer(text) if parse_intervals(m.group(3))}
@@ -170,6 +181,8 @@ def parse_post(text: str, posted: Optional[date] = None) -> Optional[Schedule]:
     """Повертає Schedule, якщо пост схожий на графік ГПВ, інакше None."""
     lowered = text.lower()
     if not any(w in lowered for w in _NO_POWER_WORDS):
+        return None
+    if is_regional(text):  # графік окремого району — не наш, інакше він затер би обласний
         return None
     queues: Dict[str, List[Interval]] = {}
     for m in _QUEUE_LINE.finditer(text):

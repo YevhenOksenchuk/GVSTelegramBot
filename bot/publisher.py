@@ -26,7 +26,7 @@ except ImportError:  # pragma: no cover
 from .alerts import Alerts
 from .announcements import classify_gav, format_announcement, format_gav, gav_note, is_announcement, is_special
 from .formatter import CAPTION_LIMIT, TEXT_LIMIT, format_caption, hard_trim
-from .parser import Schedule, parse_post, unrecognized_lines
+from .parser import Schedule, is_regional, parse_post, unrecognized_lines
 from .render import render_schedule
 from .scraper import Post, fetch_posts
 from .stats import MonthStats, month_stats
@@ -42,6 +42,9 @@ ALERTS: Optional[Alerts] = None  # встановлює main.py; у тестах
 async def _alert(key: str, text: str, ttl: int = 3600) -> None:
     if ALERTS is not None:
         await ALERTS.notify(key, text, ttl)
+
+
+_RANGE_HINT = re.compile(r"\d{1,2}:\d{2}\s*[-–—]\s*\d{1,2}:\d{2}")
 
 
 def _looks_like_schedule(text: str) -> bool:
@@ -507,6 +510,14 @@ class Watcher:
 
     async def report_post_problems(self, post: Post, schedule: Optional[Schedule]) -> None:
         """Алерти власникам: рядки нового формату або графік-картинка, які бот не прочитає."""
+        if schedule is None and is_regional(post.text) and _RANGE_HINT.search(post.text):
+            await _alert(
+                f"regional:{post.post_id}",
+                f"ℹ️ Обленерго опублікувало графік для окремого району, а не для всієї області — "
+                f"я його не публікую:\n{post.url}",
+                ttl=86400,
+            )
+            return
         bad = unrecognized_lines(post.text)
         if bad:
             shown = "\n".join(escape(line) for line in bad[:5])

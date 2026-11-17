@@ -126,3 +126,12 @@ def test_unrecognized_line_is_logged(caplog):
     with caplog.at_level("WARNING"):
         parse_post(text, date(2026, 10, 8))
     assert "Не розпізнано рядок графіка" in caplog.text and "5.3" in caplog.text
+
+
+def test_regional_schedule_is_not_the_oblast_schedule():
+    """Реальний пост 17 листопада: індивідуальні графіки для Уманського району — не публікуємо як обласний."""
+    from bot.parser import is_regional
+
+    text = (Path(__file__).parent / "real_regional_17nov.txt").read_text(encoding="utf-8")
+    assert is_regional(text) and parse_post(text, date(2026, 11, 17)) is None
+    assert not is_regional(SAMPLE) and parse_post(SAMPLE, date(2026, 10, 8)) is not None
