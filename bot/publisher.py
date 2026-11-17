@@ -25,8 +25,8 @@ except ImportError:  # pragma: no cover
 
 from .alerts import Alerts
 from .announcements import classify_gav, format_announcement, format_gav, gav_note, is_announcement, is_special
-from .formatter import CAPTION_LIMIT, TEXT_LIMIT, format_caption, hard_trim
-from .parser import Schedule, is_regional, parse_post, unrecognized_lines
+from .formatter import CAPTION_LIMIT, TEXT_LIMIT, format_caption, format_regional_caption, hard_trim
+from .parser import Schedule, is_regional, parse_post, parse_regional, unrecognized_lines
 from .render import render_schedule
 from .scraper import Post, fetch_posts
 from .stats import MonthStats, month_stats
@@ -381,6 +381,28 @@ async def publish_gav(bot: Bot, storage: Storage, post: Post, kind: str, time: O
     return await broadcast_text(bot, storage, body, post.post_id, silent=is_quiet(kyiv_now()))
 
 
+async def publish_regional(bot: Bot, storage: Storage, post: Post, schedule: Schedule) -> int:
+    """Індивідуальний графік окремого району: окремий пост із позначкою району.
+
+    Не закріплюється і записується без дати (day=None), тож не впливає на /fix, нагадування й статистику.
+    """
+    if schedule.day and schedule.day < kyiv_now().date():
+        return 0
+    caption = format_regional_caption(schedule, post.url)
+    try:
+        png: Optional[bytes] = render_schedule(schedule)
+    except Exception:
+        log.exception("Не вдалося намалювати індивідуальний графік — надсилаю лише текст")
+        png = None
+    sent = 0
+    for chat_id, _ in await storage.active_chats_typed():
+        if await send_schedule(bot, storage, chat_id, png, caption, post.post_id, None):
+            sent += 1
+        await asyncio.sleep(0.05)
+    log.info("Індивідуальний графік (%s) розіслано в %d чатів", schedule.region, sent)
+    return sent
+
+
 async def on_post_deleted(bot: Bot, storage: Storage, owner_ids: FrozenSet[int], post_id: int) -> None:
     """Обленерго видалило пост. Якщо бот з нього щось публікував — питаємо власників, чи прибрати."""
     await storage.mark_deleted(post_id)
@@ -463,7 +485,10 @@ class Watcher:
             if schedule is None:
                 if old_hash is None:  # новий пост без графіка
                     gav = classify_gav(post.text)
-                    if gav:  # аварійні відключення — одразу й коротко
+                    regional = parse_regional(post.text, post.posted_at.astimezone(KYIV).date())
+                    if regional:  # індивідуальний графік району — окремим постом, обласний не чіпаємо
+                        await publish_regional(self.bot, self.storage, post, regional)
+                    elif gav:  # аварійні відключення — одразу й коротко
                         await publish_gav(self.bot, self.storage, post, *gav)
                     elif is_announcement(post.text):  # решта важливого — на модерацію власникам
                         await propose_announcement(self.bot, self.storage, self.owner_ids, post)
@@ -511,12 +536,13 @@ class Watcher:
     async def report_post_problems(self, post: Post, schedule: Optional[Schedule]) -> None:
         """Алерти власникам: рядки нового формату або графік-картинка, які бот не прочитає."""
         if schedule is None and is_regional(post.text) and _RANGE_HINT.search(post.text):
-            await _alert(
-                f"regional:{post.post_id}",
-                f"ℹ️ Обленерго опублікувало графік для окремого району, а не для всієї області — "
-                f"я його не публікую:\n{post.url}",
-                ttl=86400,
-            )
+            if parse_regional(post.text) is None:  # розібраний публікується окремо (publish_regional)
+                await _alert(
+                    f"regional:{post.post_id}",
+                    f"ℹ️ Обленерго опублікувало графік для окремого району, але я не зміг його розібрати "
+                    f"і не публікую:\n{post.url}",
+                    ttl=86400,
+                )
             return
         bad = unrecognized_lines(post.text)
         if bad:

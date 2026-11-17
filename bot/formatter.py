@@ -53,6 +53,24 @@ def _previous_label(schedule: Schedule) -> str:
     return f"графіка від {prev:%d.%m %H:%M}"
 
 
+def format_regional_caption(schedule: Schedule, source_url: str) -> str:
+    """Підпис до індивідуального графіка окремого району (не обласного)."""
+    region = escape(schedule.region or "окремий район")
+    region = region[0].upper() + region[1:]
+    head = f"📍 <b>Індивідуальний графік — {region}</b>"
+    if schedule.date_label:
+        head += f", <b>{escape(schedule.date_label)}</b>"
+    lines = [head]
+    if schedule.region_note:
+        lines.append(f"<i>{escape(schedule.region_note)}</i>")
+    lines.append("")
+    lines += [f"🔴 <b>{q}</b>  {_intervals(schedule.queues[q])}" for q in QUEUES if q in schedule.queues]
+    lines += ["", "Для решти області діє звичайний графік ГПВ.",
+              f'<a href="{escape(source_url)}">Джерело: Черкасиобленерго</a>']
+    text = "\n".join(lines)
+    return text if tg_len(text) <= CAPTION_LIMIT else hard_trim(text)
+
+
 def format_caption(schedule: Schedule, source_url: str, my_queue: Optional[str] = None) -> str:
     """Підпис до картинки. my_queue — підчерга читача (в особистих): додає персональний рядок угорі.
 

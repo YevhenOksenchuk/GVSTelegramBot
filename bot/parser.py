@@ -41,6 +41,8 @@ class Schedule:
     has_previous: bool = False  # чи був раніше графік на цю ж дату
     previous: Optional["Schedule"] = None  # попередня версія графіка на цю ж дату
     post_id: Optional[int] = None  # пост обленерго, з якого розібрано графік
+    region: Optional[str] = None  # індивідуальний графік окремого району: підпис, напр. «частина Уманського району»
+    region_note: Optional[str] = None  # для кого діє (речення з поста)
 
     def off_minutes(self, queue: str) -> int:
         return sum(e - s for s, e in self.queues.get(queue, []))
@@ -175,6 +177,36 @@ def unrecognized_lines(text: str) -> List[str]:
         if line and line[0].isdigit() and _RANGE.search(line) and line not in matched:
             result.append(line)
     return result
+
+
+_REGION_NAME = re.compile(r"в\s+(частині\s+)?(\S+)\s+район[іу]", re.I)
+_REGION_NOTE = re.compile(r"[^.\n]*діють\s+для\s+споживачів[^.\n]*\.", re.I)
+MIN_REGIONAL_QUEUES = 2
+
+
+def parse_regional(text: str, posted: Optional[date] = None) -> Optional[Schedule]:
+    """Індивідуальний графік окремого району. У queues — лише черги, названі в пості."""
+    if not is_regional(text):
+        return None
+    queues: Dict[str, List[Interval]] = {}
+    for m in _QUEUE_LINE.finditer(text):
+        intervals = parse_intervals(m.group(3))
+        if intervals:
+            queues.setdefault(f"{m.group(1)}.{m.group(2)}", []).extend(intervals)
+    if len(queues) < MIN_REGIONAL_QUEUES:
+        return None
+    name = _REGION_NAME.search(text)
+    if name:
+        region = ("частина " if name.group(1) else "") + f"{name.group(2)} району"
+    else:
+        region = "окремий район"
+    note = _REGION_NOTE.search(text)
+    return Schedule(
+        day=parse_date(text, posted),
+        queues={q: _merge(v) for q, v in queues.items()},
+        region=region,
+        region_note=note.group(0).strip() if note else None,
+    )
 
 
 def parse_post(text: str, posted: Optional[date] = None) -> Optional[Schedule]:

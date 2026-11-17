@@ -106,7 +106,8 @@ def render_schedule(schedule: Schedule, month=None) -> bytes:
     d = ImageDraw.Draw(img)
 
     # Заголовок
-    d.text((PAD, PAD), "Графік відключень світла", font=_font(50, True), fill=TEXT)
+    d.text((PAD, PAD), "Індивідуальний графік" if schedule.region else "Графік відключень світла",
+           font=_font(50, True), fill=TEXT)
     # Усі частини на одній базовій лінії (anchor "ls"), бо жирний і звичайний шрифти мають різні відступи
     sx, baseline = PAD, PAD + 100
     if schedule.date_label:
@@ -114,7 +115,7 @@ def render_schedule(schedule: Schedule, month=None) -> bytes:
         sx += d.textlength(schedule.date_label, font=_font(34, True))
         d.text((sx, baseline), "  ·  ", font=_font(34), fill=SUBTLE, anchor="ls")
         sx += d.textlength("  ·  ", font=_font(34))
-    d.text((sx, baseline), "м. Черкаси", font=_font(34), fill=SUBTLE, anchor="ls")
+    d.text((sx, baseline), schedule.region or "м. Черкаси", font=_font(34), fill=SUBTLE, anchor="ls")
     if schedule.updated:
         badge = "ОНОВЛЕНО"
         if schedule.time_label:
@@ -202,7 +203,9 @@ def render_schedule(schedule: Schedule, month=None) -> bytes:
             is_new = any(a_ < e_ and s_ < b_ for a_, b_ in added)
             parts.append((f"{_hhmm(s_)}–{_hhmm(e_)}", NOW if is_new else TIME_TEXT, False))
         if not intervals:
-            parts.append(("без відключень", ON_TEXT, False))
+            # в індивідуальному графіку черги, якої немає в пості, не знаємо — не обіцяємо світло
+            unknown = schedule.region and q not in schedule.queues
+            parts.append(("не вказано в графіку", MUTED, False) if unknown else ("без відключень", ON_TEXT, False))
         for s_, e_ in removed:
             parts.append((f"{_hhmm(s_)}–{_hhmm(e_)}", NOW, True))
         sep = "   "
