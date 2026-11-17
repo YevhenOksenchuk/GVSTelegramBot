@@ -336,7 +336,9 @@ async def fix_messages(bot: Bot, storage: Storage, day: date) -> Tuple[int, List
     for chat_id, message_id, kind in await storage.latest_sent_per_chat(day.isoformat()):
         post_id = await storage.sent_post_id(chat_id, message_id)
         row = await storage.get_post(post_id) if post_id else None
-        regional = parse_regional(row[0], datetime.fromisoformat(row[2]).astimezone(KYIV).date()) if row else None
+        if not row or _parse(row[0], datetime.fromisoformat(row[2])):  # у пості є обласний графік — це він і є
+            continue
+        regional = parse_regional(row[0], datetime.fromisoformat(row[2]).astimezone(KYIV).date())
         if not regional:
             continue
         try:
@@ -496,6 +498,7 @@ class Watcher:
     async def check_once(self, client: httpx.AsyncClient) -> None:
         first_run = not await self.storage.has_any_posts()
         to_publish = {}  # дата -> (графік, посилання): по одному, найсвіжішому, на кожну дату
+        regionals = []   # (пост, індивідуальний графік району) — після обласних
         posts = await fetch_posts(client, self.channel)
         if not first_run:
             await self.detect_deleted(posts)
@@ -513,13 +516,15 @@ class Watcher:
             if first_run:
                 continue
             await self.report_post_problems(post, schedule)
+            regional = None
+            if old_hash is None:  # індивідуальний графік району — окремим постом, обласний не чіпаємо
+                regional = parse_regional(post.text, post.posted_at.astimezone(KYIV).date())
+                if regional:
+                    regionals.append((post, regional))
             if schedule is None:
-                if old_hash is None:  # новий пост без графіка
+                if old_hash is None and not regional:  # новий пост без графіка
                     gav = classify_gav(post.text)
-                    regional = parse_regional(post.text, post.posted_at.astimezone(KYIV).date())
-                    if regional:  # індивідуальний графік району — окремим постом, обласний не чіпаємо
-                        await publish_regional(self.bot, self.storage, post, regional)
-                    elif gav:  # аварійні відключення — одразу й коротко
+                    if gav:  # аварійні відключення — одразу й коротко
                         await publish_gav(self.bot, self.storage, post, *gav)
                     elif is_announcement(post.text):  # решта важливого — на модерацію власникам
                         await propose_announcement(self.bot, self.storage, self.owner_ids, post)
@@ -537,6 +542,53 @@ class Watcher:
         # Кілька постів за одну перевірку: на кожну дату шлемо лише найсвіжіший, у порядку публікації.
         for schedule, url in to_publish.values():
             await broadcast(self.bot, self.storage, schedule, url)
+        for post, regional in regionals:
+            await publish_regional(self.bot, self.storage, post, regional)
+
+    async def reparse_recent(self, limit: int = 20) -> int:
+        """Після оновлення бота: пости, в яких раніше не знайшли обласного графіка, а тепер знаходимо.
+
+        Такий графік розсилається, а вже надіслані з цього поста повідомлення (індивідуальний графік,
+        розібраний старим кодом неправильно) виправляються на місці. Повертає кількість таких постів.
+        """
+        today = kyiv_now().date()
+        found = 0
+        for post_id, text, url, posted_at in await self.storage.recent_plain_posts(limit):
+            posted = datetime.fromisoformat(posted_at)
+            schedule = await load_schedule(self.storage, post_id, text, posted)
+            if not schedule:
+                continue
+            found += 1
+            await self.storage.set_is_schedule(post_id)
+            log.info("Пост %s: тепер розпізнано обласний графік на %s", post_id, schedule.date_label)
+            if schedule.day and schedule.day < today:
+                continue
+            fresh = not (schedule.has_previous and not schedule.changed)
+            if fresh and not await has_newer_for_day(self.storage, post_id, schedule):
+                already = await self.storage.sent_for_post(post_id)
+                await broadcast(self.bot, self.storage, schedule, url)
+            else:
+                already = await self.storage.sent_for_post(post_id)
+            regional = parse_regional(text, posted.astimezone(KYIV).date())
+            if not regional:
+                continue
+            caption = format_regional_caption(regional, url)
+            try:
+                png: Optional[bytes] = render_schedule(regional)
+            except Exception:
+                png = None
+            for chat_id, message_id, kind in already:  # раніше надіслане з цього поста — виправити на місці
+                try:
+                    await _edit_published(self.bot, chat_id, message_id, kind, png, caption)
+                except Exception as e:
+                    if "not modified" in str(e).lower():
+                        continue
+                    # повідомлення вже видалили вручну — надсилаємо правильне заново
+                    log.info("Не вдалося виправити %s/%s (%s) — надсилаю заново", chat_id, message_id, e)
+                    if await self.storage.is_active(chat_id):
+                        await send_schedule(self.bot, self.storage, chat_id, png, caption, post_id, None)
+                await asyncio.sleep(0.05)
+        return found
 
     async def backfill(self, client: httpx.AsyncClient, until: date, max_pages: int = 12) -> int:
         """Дозавантажити старіші пости каналу (сторінками «до»), поки не дійдемо до дати until.
@@ -642,6 +694,10 @@ class Watcher:
     async def run(self) -> None:
         async with httpx.AsyncClient() as client:
             await self.ensure_history(client)
+            try:
+                await self.reparse_recent()
+            except Exception:
+                log.exception("Не вдалося перечитати останні пости")
             while True:
                 self.last_check = kyiv_now()
                 try:

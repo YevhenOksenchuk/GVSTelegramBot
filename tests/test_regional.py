@@ -95,3 +95,90 @@ def test_fix_converts_wrongly_published_regional_post(tmp_path, monkeypatch):
             await storage.close()
 
     asyncio.run(scenario())
+
+
+COMBINED = (Path(__file__).parent / "real_combined_18nov.txt").read_text(encoding="utf-8")
+
+
+def test_combined_post_is_split_into_oblast_and_regional():
+    """18 листопада: в одному пості і графік по області, і індивідуальний для Уманщини."""
+    s = parse_post(COMBINED, date(2026, 11, 17))
+    assert s and s.day == date(2026, 11, 18) and len(s.queues) == 12
+    assert s.queues["1.2"] == [(0, 120), (360, 480), (720, 840), (1080, 1260)]  # не змішано з уманським
+    assert s.queues["5.1"] == [(240, 360), (600, 720), (900, 1020)]
+    r = parse_regional(COMBINED, date(2026, 11, 17))
+    assert r.region == "частина Уманського району" and r.day == date(2026, 11, 18)
+    assert sorted(r.queues) == ["1.2", "2.2", "3.2", "4.2", "5.2", "6.2"]
+    assert r.queues["1.2"] == [(0, 180), (360, 540), (720, 900), (1080, 1260)]
+    assert "Христинівської філій" in r.region_note
+    assert parse_post(TEXT, date(2026, 11, 17)) is None  # суто районний пост — як і раніше
+
+
+def _combined_env(tmp_path, monkeypatch):
+    monkeypatch.setattr(publisher, "kyiv_now", lambda: datetime(2026, 11, 17, 22, 0, tzinfo=publisher.KYIV))
+    feed = []
+
+    async def fake_fetch(client, channel, before=None):
+        return list(feed)
+
+    monkeypatch.setattr(publisher, "fetch_posts", fake_fetch)
+    return feed
+
+
+def test_watcher_publishes_both_parts_of_combined_post(tmp_path, monkeypatch):
+    feed = _combined_env(tmp_path, monkeypatch)
+
+    async def scenario():
+        storage = Storage(str(tmp_path / "t.db"))
+        await storage.open()
+        try:
+            await storage.add_chat(-100, "Канал", "channel", 1)
+            bot = FakeBot()
+            w = publisher.Watcher(bot, storage, "x", 60, owner_ids=frozenset({1}))
+            feed.append(Post(1, "x", datetime(2026, 11, 17, 10, 0, tzinfo=timezone.utc), "u1"))
+            await w.check_once(None)
+            feed.append(Post(2032, COMBINED, datetime(2026, 11, 17, 19, 43, tzinfo=timezone.utc), "u"))
+            await w.check_once(None)
+            await w.check_once(None)
+            assert len(bot.photos) == 2
+            assert "Графік відключень (ГПВ)</b> — <b>18 листопада" in bot.photos[0][1]
+            assert "Індивідуальний графік — Частина Уманського району" in bot.photos[1][1]
+            assert bot.pins == [(-100, 1)]  # закріплено обласний
+            assert await storage.latest_sent_per_chat("2026-11-18") == [(-100, 1, "photo")]
+            # /fix не перетворює обласне повідомлення на індивідуальне
+            ok, failures = await publisher.fix_messages(bot, storage, date(2026, 11, 18))
+            assert failures == [] and ok == 1 and "Індивідуальний" not in bot.edits[-1][3]
+        finally:
+            await storage.close()
+
+    asyncio.run(scenario())
+
+
+def test_reparse_after_update_publishes_missed_oblast_and_repairs_regional(tmp_path, monkeypatch):
+    """Старий код опублікував мішаний пост як індивідуальний; у каналі це повідомлення вже видалили вручну."""
+    _combined_env(tmp_path, monkeypatch)
+
+    async def scenario():
+        storage = Storage(str(tmp_path / "t.db"))
+        await storage.open()
+        try:
+            await storage.add_chat(-100, "Канал", "channel", 1)
+            await storage.add_chat(-200, "Група", "supergroup", 1)
+            await storage.save_post(2032, COMBINED, "u", datetime(2026, 11, 17, 19, 43, tzinfo=timezone.utc).isoformat(),
+                                    False)
+            await storage.record_sent(-100, 50, 2032, None, "photo")
+            await storage.record_sent(-200, 51, 2032, None, "photo")
+            bot = FakeBot(edit_fails={-100})
+            w = publisher.Watcher(bot, storage, "x", 60, owner_ids=frozenset({1}))
+            assert await w.reparse_recent() == 1
+            oblast = [c for c in bot.photos if "Графік відключень (ГПВ)" in c[1]]
+            assert sorted(c[0] for c in oblast) == [-200, -100] and len(bot.pins) == 2
+            assert [(e[1], e[2]) for e in bot.edits] == [(-200, 51)] and "Індивідуальний" in bot.edits[0][3]
+            resent = [c for c in bot.photos if "Індивідуальний" in c[1]]
+            assert [c[0] for c in resent] == [-100]  # там, де старе видалили, — надіслано заново
+            assert [s.post_id for s, _ in await publisher.current_schedules(storage)] == [2032]
+            assert await w.reparse_recent() == 0 and len(bot.photos) == 3  # повторний запуск нічого не шле
+        finally:
+            await storage.close()
+
+    asyncio.run(scenario())

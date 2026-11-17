@@ -180,8 +180,57 @@ def unrecognized_lines(text: str) -> List[str]:
 
 
 _REGION_NAME = re.compile(r"в\s+(частині\s+)?(\S+)\s+район[іу]", re.I)
+_REGION_NAME_PART = re.compile(r"частини\s+споживачів\s+(\S+)\s+району", re.I)
 _REGION_NOTE = re.compile(r"[^.\n]*діють\s+для\s+споживачів[^.\n]*\.", re.I)
+_REGION_FOR = re.compile(r"для\s+споживачів\s+ВСП[^.\n]*", re.I)
+_OBLAST_HEADER = re.compile(r"по\s+області|крім", re.I)
 MIN_REGIONAL_QUEUES = 2
+
+
+def _blocks(text: str) -> List[Tuple[List[str], List[str]]]:
+    """Пост як список блоків: (рядки-заголовок перед блоком, рядки підчерг).
+
+    Блок — рядки підчерг поспіль (порожні рядки не рахуються); будь-який інший текст починає новий заголовок.
+    """
+    blocks: List[Tuple[List[str], List[str]]] = []
+    header: List[str] = []
+    current: List[str] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if _QUEUE_LINE.match(line):
+            current.append(line)
+            continue
+        if current:
+            blocks.append((header, current))
+            header, current = [], []
+        header.append(line)
+    if current:
+        blocks.append((header, current))
+    return blocks
+
+
+def split_post(text: str) -> Tuple[str, str]:
+    """(рядки обласного графіка, рядки індивідуального графіка району).
+
+    Обленерго буває публікує в одному пості і графік по області, і окремий — для частини району.
+    """
+    blocks = _blocks(text)
+    if not is_regional(text):
+        return "\n".join(line for _, lines in blocks for line in lines), ""
+    if len(blocks) <= 1:  # увесь пост — про район
+        return "", "\n".join(line for _, lines in blocks for line in lines)
+    flags: List[bool] = []  # чи блок — індивідуальний
+    for header, _ in blocks:
+        if header and _OBLAST_HEADER.search(header[-1]):
+            flags.append(False)
+        else:
+            flags.append(is_regional("\n".join(header[-2:])))
+    if all(flags) and len({m.group(1) + m.group(2) for m in map(_QUEUE_LINE.match, blocks[0][1])}) == len(QUEUES):
+        flags[0] = False  # перший блок з усіма 12 підчергами — обласний, навіть якщо заголовок нечіткий
+    oblast = [line for (_, lines), regional in zip(blocks, flags) if not regional for line in lines]
+    regional_lines = [line for (_, lines), regional in zip(blocks, flags) if regional for line in lines]
+    return "\n".join(oblast), "\n".join(regional_lines)
 
 
 def parse_regional(text: str, posted: Optional[date] = None) -> Optional[Schedule]:
@@ -189,23 +238,32 @@ def parse_regional(text: str, posted: Optional[date] = None) -> Optional[Schedul
     if not is_regional(text):
         return None
     queues: Dict[str, List[Interval]] = {}
-    for m in _QUEUE_LINE.finditer(text):
+    for m in _QUEUE_LINE.finditer(split_post(text)[1]):
         intervals = parse_intervals(m.group(3))
         if intervals:
             queues.setdefault(f"{m.group(1)}.{m.group(2)}", []).extend(intervals)
     if len(queues) < MIN_REGIONAL_QUEUES:
         return None
-    name = _REGION_NAME.search(text)
-    if name:
+    name, part = _REGION_NAME.search(text), _REGION_NAME_PART.search(text)
+    if part:
+        region = f"частина {part.group(1)} району"
+    elif name:
         region = ("частина " if name.group(1) else "") + f"{name.group(2)} району"
     else:
         region = "окремий район"
     note = _REGION_NOTE.search(text)
+    whom = _REGION_FOR.search(text)
+    if note:
+        region_note: Optional[str] = note.group(0).strip()
+    elif whom:
+        region_note = "Діє " + whom.group(0).strip().rstrip(":") + "."
+    else:
+        region_note = None
     return Schedule(
         day=parse_date(text, posted),
         queues={q: _merge(v) for q, v in queues.items()},
         region=region,
-        region_note=note.group(0).strip() if note else None,
+        region_note=region_note,
     )
 
 
@@ -214,10 +272,10 @@ def parse_post(text: str, posted: Optional[date] = None) -> Optional[Schedule]:
     lowered = text.lower()
     if not any(w in lowered for w in _NO_POWER_WORDS):
         return None
-    if is_regional(text):  # графік окремого району — не наш, інакше він затер би обласний
-        return None
+    # Графік окремого району — не наш (інакше він затер би обласний); з мішаного поста беремо лише обласну частину.
+    body = split_post(text)[0] if is_regional(text) else text
     queues: Dict[str, List[Interval]] = {}
-    for m in _QUEUE_LINE.finditer(text):
+    for m in _QUEUE_LINE.finditer(body):
         queue, rest = f"{m.group(1)}.{m.group(2)}", m.group(3)
         intervals = parse_intervals(rest)
         if intervals or re.search(r"(не\s+відключа|без\s+відключ|світло\s+є)", rest, re.I):

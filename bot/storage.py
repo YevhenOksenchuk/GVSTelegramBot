@@ -557,6 +557,19 @@ class Storage:
         ) as cur:
             return list(await cur.fetchall())
 
+    async def recent_plain_posts(self, limit: int = 20) -> List[Tuple[int, str, str, str]]:
+        """(post_id, text, url, posted_at) серед останніх постів — ті, де графіка не знайшли; від старіших."""
+        async with self.db.execute(
+            "SELECT post_id, text, url, posted_at FROM (SELECT * FROM posts ORDER BY post_id DESC LIMIT ?) "
+            "WHERE is_schedule=0 AND deleted_at IS NULL AND text IS NOT NULL ORDER BY post_id",
+            (limit,),
+        ) as cur:
+            return list(await cur.fetchall())
+
+    async def set_is_schedule(self, post_id: int) -> None:
+        await self.db.execute("UPDATE posts SET is_schedule=1 WHERE post_id=?", (post_id,))
+        await self.db.commit()
+
     async def recent_schedule_posts(self, limit: int = 10) -> List[Tuple[int, str, str, str]]:
         """(post_id, text, url, posted_at) останніх постів з графіком, від новіших до старіших."""
         async with self.db.execute(
